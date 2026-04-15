@@ -1,9 +1,9 @@
 # Design and Architecture Document: Monkey Devs
 
-**Version**: 1.0
-**Date**: 2026-04-14
-**Status**: Finalized
-**Spec Source**: spec-monkey-devs.md v1.0-draft
+**Version**: 1.2
+**Date**: 2026-04-15
+**Status**: Finalized (v1.2 — adversarial review loop + documentation agent added)
+**Spec Source**: spec-monkey-devs.md v1.2
 **Architect Session**: 2026-04-14
 
 ---
@@ -175,7 +175,7 @@ class WorkflowState(TypedDict):
     current_stage: int                       # 1–5
     workflow_status: str                     # active | completed | interrupted
     stage_statuses: dict[int, str]           # pending | active | complete | approved | rejected
-    stage_outputs: dict[int, str]            # path to artifact per stage
+    stage_outputs: dict[int, str]            # absolute path to artifact per stage
     stage_models: dict[int, str]             # model used per stage (audit)
     correction_active: bool
     correction_stage: int | None
@@ -183,9 +183,15 @@ class WorkflowState(TypedDict):
     tasks: list[str]                         # task IDs from tasks.yaml
     tasks_dispatched: list[str]
     tasks_completed: list[str]
+    current_task_index: int                  # index into tasks[] for Stage 3 Send() fan-out
     gate_decisions: dict[int, str]           # approved | fix | rejected
     allocated_skills: dict[int, list[str]]
     allocated_tools: dict[int, list[str]]
+    thread_id: str                           # LangGraph thread ID used for interrupt/resume
+    correction_counts: dict[int, int]        # number of correction cycles per stage
+    review_verdicts: dict[int, str]          # pass | warn | block per stage (keyed by stage number)
+    review_brief_paths: dict[int, str]       # absolute path to fix brief per stage
+    review_skipped: dict[int, bool]          # True when review verdict was pass and fix_node was bypassed
 ```
 
 **tasks.yaml schema**
@@ -226,8 +232,10 @@ models:
   concept-spec:    google/gemini-2.5-pro
   architecture:    google/gemini-2.5-pro
   implementation:  anthropic/claude-opus-4-6
-  code-fixing:     openai/codex-mini
+  code-fixing:     openai/o4-mini
   delivery:        anthropic/claude-sonnet-4-6
+  reviewer:        anthropic/claude-opus-4-6   # adversarial critique — global, applies to all stages
+  fixer:           google/gemini-2.5-pro        # artifact rewrite — used by fix_node and documentation_node
 
 providers:
   anthropic:
@@ -236,6 +244,22 @@ providers:
     api_key_env: OPENAI_API_KEY
   google:
     api_key_env: GEMINI_API_KEY
+
+timeouts:
+  concept-spec:    120      # seconds per LLM call attempt
+  architecture:    120
+  implementation:  180
+  code-fixing:     120
+  delivery:        60
+  reviewer:        90
+  fixer:           120
+
+workflow:
+  max_corrections_per_stage: 3
+  max_handoff_chars: 400000   # ~100K tokens at 4 chars/token; truncation applied if exceeded
+
+review:
+  enabled: true              # set false to bypass review_node and fix_node entirely
 ```
 
 ---
@@ -253,7 +277,7 @@ providers:
 | `monkey-devs status` | Show workflow state, current stage, task list |
 | `monkey-devs approve` | Approve current stage gate, advance to next stage |
 | `monkey-devs reject --reason "..."` | Reject current stage, enter correction branch |
-| `monkey-devs resume` | Resume an interrupted workflow from last checkpoint |
+| `monkey-devs resume [--project-path PATH]` | Resume an interrupted workflow from last checkpoint. If run outside a project directory and `--project-path` is omitted, prints: "No .opencode/ directory found. Run from your project directory or pass --project-path." |
 | `monkey-devs tasks` | List tasks and their status (Stage 3+) |
 | `monkey-devs registry` | Show resource registry contents |
 | `monkey-devs skills list` | List skills with stage assignments |
@@ -344,8 +368,10 @@ what to present at completion. Includes rejection reason if correction branch.]
 | Concept & Spec | `google/gemini-2.5-pro` | Largest context window for long intake conversations; strong reasoning for requirements |
 | Architecture | `google/gemini-2.5-pro` | Handles full project context during system design |
 | Implementation | `anthropic/claude-opus-4-6` | Highest code generation quality for production code + tests |
-| Code Fixing | `openai/codex-mini` | Purpose-built for code understanding and repair |
+| Code Fixing | `openai/o4-mini` | Strong code understanding and repair; confirmed available in OpenAI API |
 | Delivery | `anthropic/claude-sonnet-4-6` | Fast and precise for documentation and delivery summary |
+| Reviewer (all stages) | `anthropic/claude-opus-4-6` | Strong critical reasoning for adversarial artifact critique |
+| Fixer (all stages) | `google/gemini-2.5-pro` | Large context window for full-artifact rewrites and documentation generation |
 
 **Communication style**: Synchronous — CLI invokes LangGraph, LangGraph invokes LiteLLM, output streams to terminal
 **Deployment model**: Local Python package, installed via pip/uv. No server, no daemon, no cloud.
@@ -398,6 +424,9 @@ Project filesystem (user's working directory)
 | LangGraph Graph | Workflow state machine | Stage transitions, interrupt/resume, correction branch routing |
 | Python CLI Control Loop | Orchestrator (no LLM) | Registry loading, skill selection, handoff composition, task dispatch |
 | Stage Nodes (×5) | Async LLM functions | Execute stage work via LiteLLM; stream output; write artifacts |
+| Documentation Node (Stage 5a) | Async LLM function | Generate API reference, developer guide, and inline docstrings |
+| Review Node (shared) | Async LLM function | Critique each stage artifact; produce structured fix brief |
+| Fix Node (shared) | Async LLM function | Rewrite stage artifact based on fix brief; skipped on `pass` verdict |
 | Correction Branches (×5) | LangGraph nodes | Re-invoke stage node with rejection reason + prior output |
 | SQLite Checkpointer | Persistence layer | Durable state across sessions |
 | Resource Registry | YAML manifest | Skills and tools catalog |
@@ -415,18 +444,35 @@ Project filesystem (user's working directory)
 #### Python CLI Control Loop (Orchestrator)
 
 - **Responsibility**: The deterministic brain of the system. Reads registry, selects skills and tools for the current stage, composes handoff messages, dispatches tasks, renders stage gates, issues LangGraph commands.
-- **Key functions**: `load_registry()`, `compose_handoff()`, `get_stage_tools()`, `render_stage_gate()`, `dispatch_tasks()`
+- **Key functions**: `load_registry()`, `compose_handoff()`, `get_stage_tools()`, `render_stage_gate()`, `dispatch_tasks()`, `run_agentic_loop()`, `check_api_key_for_stage()`, `validate_artifacts()`
 - **State**: Stateless between CLI invocations — all state lives in LangGraph SQLite
 - **LLM calls**: None. Zero LLM tokens consumed by orchestration.
 - **FRs fulfilled**: FR-02, FR-03, FR-07, FR-24, FR-26, FR-29, FR-30, NFR-03, NFR-05
 
+#### Agentic Loop (shared by all stage nodes)
+
+Every stage node executes a tool-execution agentic loop. This loop is implemented in `orchestrator.py` as `run_agentic_loop()` and called by all stage node functions:
+
+1. Build initial `messages` list with the handoff as the system message.
+2. Call `litellm.acompletion()` with `stream=True` and the stage's tool schemas.
+3. Consume the async stream chunk-by-chunk: accumulate `content` to terminal; accumulate `tool_calls`.
+4. Append the assistant turn (content + tool_calls) to `messages`.
+5. If the turn contains no tool calls → final response. Write artifact and exit loop.
+6. For each tool call: call `execute_tool(tool_call, stage)`, append a `{"role": "tool", ...}` message to `messages`.
+7. Go to step 2.
+
+Retry policy (implemented in `run_agentic_loop()`): exponential backoff with 3 attempts for HTTP 429, 503, and network errors; delays of 1 s, 2 s, 4 s. Timeout per attempt is read from `config.timeouts[stage_key]`. After 3 failures the exception is re-raised and the stage node logs a `stage_error` event; the workflow pauses with a clear user message.
+
+**FRs fulfilled**: FR-09, FR-12
+
 #### Stage Node: Concept & Spec
 
-- **Responsibility**: Conversational intake with the user; produces concept document and requirements spec; proposes 2–3 ranked stack candidates.
+- **Responsibility**: Multi-turn conversational intake with the user; produces concept document and requirements spec; proposes 2–3 ranked stack candidates.
 - **Model**: `google/gemini-2.5-pro`
 - **Skills**: `conversational-intake`, `requirements-writing`, `stack-evaluation`
-- **Tools**: file-read (project docs), file-write (`docs/`)
+- **Tools**: `filesystem_read` (project docs), `filesystem_write` (`docs/`)
 - **Output artifact**: `docs/concept.md`, `docs/spec.md`
+- **Multi-turn loop**: Stage 1 is a terminal input loop. After each LLM response is printed, the node calls `input("You: ")` and appends the user turn to `messages`. The loop continues until the LLM produces a response containing the sentinel `<intake-complete/>`, at which point the node writes the artifact and exits. The `conversational-intake` skill specifies when to emit this sentinel.
 - **FRs fulfilled**: FR-13, FR-14, FR-34
 
 #### Stage Node: Architecture
@@ -440,30 +486,56 @@ Project filesystem (user's working directory)
 
 #### Stage Node: Implementation
 
-- **Responsibility**: Writes production code and tests for one assigned task unit. Invoked once per task by the orchestrator's task-dispatch logic.
+- **Responsibility**: Writes production code and tests for one assigned task unit. Invoked once per task via LangGraph `Send()` fan-out.
 - **Model**: `anthropic/claude-opus-4-6`
 - **Skills**: `tdd-implementation`, `code-generation`
-- **Tools**: file-read (full project), file-write (full project), bash (build/test commands — allowlisted)
+- **Tools**: `filesystem_read` (full project), `filesystem_write` (full project), `bash_execute` (build/test commands — allowlisted)
 - **Output artifact**: source files per task
+- **Task dispatch topology**: After Stage 2 is approved, a `dispatch_stage3` router node reads `tasks` from `WorkflowState`, runs `topological_sort(tasks)` to resolve `depends_on` order, and emits one `Send("implementation_node", {"task_id": tid})` per task. LangGraph fans out to one `implementation_node` invocation per task. Each invocation receives its `task_id` in the handoff CONTEXT block and operates independently. When all `Send()` branches complete, LangGraph merges results and advances to the Stage 3 gate.
 - **FRs fulfilled**: FR-17
 
 #### Stage Node: Code Fixing
 
 - **Responsibility**: Runs all tests; attempts to fix failures; classifies all unresolved failures as `code-issue` or `test-issue`; presents classifications at stage gate.
-- **Model**: `openai/codex-mini`
+- **Model**: `openai/o4-mini`
 - **Skills**: `test-categorization`, `systematic-debugging`
 - **Tools**: file-read (full project), file-write (full project), bash (test runner — allowlisted)
 - **Output artifact**: updated source files; classifications written to `.opencode/tasks.yaml`
 - **FRs fulfilled**: FR-18, FR-19, NFR-04
 
-#### Stage Node: Delivery
+#### Stage Node: Documentation (Stage 5a)
 
-- **Responsibility**: Produces delivery summary and README; confirms repository is locally runnable.
+- **Responsibility**: Generates technical reference documentation for the completed, fixed codebase. Runs as the first sub-phase of Stage 5, before the Delivery node. Uses the `fixer` model — same large-context rewrite capability used by the Fix node.
+- **Model**: `fixer` (`google/gemini-2.5-pro`)
+- **Skills**: `api-documentation`, `developer-guide-writing`, `docstring-writing`
+- **Tools**: `filesystem_read` (full project), `filesystem_write` (`docs/` and source files)
+- **Output artifacts**: `docs/api-reference.md`, `docs/developer-guide.md`, updated source files (inline docstrings/comments)
+- **`stage_models` key**: `"5a"` — recorded separately from the Delivery node for audit
+
+#### Stage Node: Delivery (Stage 5b)
+
+- **Responsibility**: Produces delivery summary and README; confirms repository is locally runnable. Runs after the Documentation node as the second sub-phase of Stage 5.
 - **Model**: `anthropic/claude-sonnet-4-6`
 - **Skills**: `delivery-summary`, `readme-writing`
-- **Tools**: file-read (full project), file-write (`docs/`, README)
+- **Tools**: `filesystem_read` (full project), `filesystem_write` (`docs/`, README)
 - **Output artifact**: `README.md`, `docs/delivery.md`
+- **`stage_models` key**: `"5b"`
 - **FRs fulfilled**: FR-20
+
+#### Review Node (shared — all stages)
+
+- **Responsibility**: Examines the primary stage artifact using the `adversarial-review` skill. Produces a structured fix brief at `.opencode/review/stage-N-fix-brief.md` with a verdict (`pass | warn | block`) and a ranked issue list (critical → high → medium), each with a concrete fix instruction. If the verdict is `pass`, updates `review_skipped[stage] = True` and exits without writing a brief — the fix node is bypassed. Runs after every primary stage node (and after Stage 5b for the combined documentation+delivery output) before `interrupt()`.
+- **Model**: `reviewer` (`anthropic/claude-opus-4-6`)
+- **Skills**: `adversarial-review`
+- **Tools**: `filesystem_read` (stage artifact only)
+- **Bypass condition**: `config.review.enabled = false` → conditional edge skips both `review_node` and `fix_node`
+
+#### Fix Node (shared — all stages)
+
+- **Responsibility**: Consumes the fix brief produced by the Review node and rewrites the stage artifact to address all listed issues. Receives the original artifact path and the fix brief path via the handoff INSTRUCTIONS block. Writes the updated artifact in place. Skipped entirely when `review_skipped[stage] = True`.
+- **Model**: `fixer` (`google/gemini-2.5-pro`)
+- **Skills**: none — the fix brief is the complete instruction set
+- **Tools**: `filesystem_read` (stage artifact + fix brief), `filesystem_write` (stage artifact)
 
 ---
 
@@ -557,6 +629,22 @@ skills:
     description: "How to read tasks.yaml and dispatch Implementation nodes"
     stages: [0]
     path: .opencode/skills/task-dispatch.md
+  - name: adversarial-review
+    description: "Adversarial critique of stage artifacts: find issues, produce ranked fix brief"
+    stages: [0]
+    path: .opencode/skills/adversarial-review.md
+  - name: api-documentation
+    description: "Generate endpoint/schema API reference from source code"
+    stages: [5]
+    path: .opencode/skills/api-documentation.md
+  - name: developer-guide-writing
+    description: "Write setup, test, and module structure developer documentation"
+    stages: [5]
+    path: .opencode/skills/developer-guide-writing.md
+  - name: docstring-writing
+    description: "Write inline docstrings and comments for public interfaces"
+    stages: [5]
+    path: .opencode/skills/docstring-writing.md
 
 tools:
   - name: filesystem
@@ -589,13 +677,82 @@ tasks:
     failure_classification: null  # code-issue | test-issue (set by Stage 4)
 ```
 
+#### Tool Schemas
+
+`get_stage_tools(stage)` returns fully-formed OpenAI-format function schemas. The four defined schemas are:
+
+```python
+FILESYSTEM_READ = {
+    "type": "function",
+    "function": {
+        "name": "filesystem_read",
+        "description": "Read the contents of a file from the local filesystem.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or project-relative path to the file."}
+            },
+            "required": ["path"]
+        }
+    }
+}
+
+FILESYSTEM_WRITE = {
+    "type": "function",
+    "function": {
+        "name": "filesystem_write",
+        "description": "Write content to a file on the local filesystem. Creates parent directories as needed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or project-relative path to the file."},
+                "content": {"type": "string", "description": "Full content to write to the file."}
+            },
+            "required": ["path", "content"]
+        }
+    }
+}
+
+FILESYSTEM_LIST = {
+    "type": "function",
+    "function": {
+        "name": "filesystem_list",
+        "description": "List files and directories at a given path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path to list."}
+            },
+            "required": ["path"]
+        }
+    }
+}
+
+BASH_EXECUTE = {
+    "type": "function",
+    "function": {
+        "name": "bash_execute",
+        "description": "Execute an allowlisted shell command. Only commands on the stage's allowlist are permitted.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute."}
+            },
+            "required": ["command"]
+        }
+    }
+}
+```
+
+`get_stage_tools(stage)` returns these schemas (not registry metadata) filtered by stage: Stages 1–5 receive `[FILESYSTEM_READ, FILESYSTEM_WRITE, FILESYSTEM_LIST]`; Stages 3 and 4 additionally receive `[BASH_EXECUTE]`.
+
 **Run log event types (JSONL)**
 ```json
 {"ts": "ISO8601", "event": "workflow_started", "project": "..."}
 {"ts": "ISO8601", "event": "stage_started", "stage": 2, "model": "google/gemini-2.5-pro"}
 {"ts": "ISO8601", "event": "skill_injected", "stage": 2, "skill": "system-design"}
 {"ts": "ISO8601", "event": "tool_granted", "stage": 2, "tool": "filesystem"}
-{"ts": "ISO8601", "event": "llm_call_complete", "stage": 2, "tokens_used": 4821}
+{"ts": "ISO8601", "event": "llm_call_complete", "stage": 2}
 {"ts": "ISO8601", "event": "artifact_written", "stage": 2, "path": "docs/architecture.md"}
 {"ts": "ISO8601", "event": "stage_gate_presented", "stage": 2}
 {"ts": "ISO8601", "event": "stage_approved", "stage": 2}
@@ -630,24 +787,32 @@ tasks:
 │   ├── resource-allocation.md
 │   ├── stage-gate.md
 │   ├── handoff-composer.md
-│   └── task-dispatch.md
+│   ├── task-dispatch.md
+│   ├── adversarial-review.md
+│   ├── api-documentation.md
+│   ├── developer-guide-writing.md
+│   └── docstring-writing.md
+├── review/                        # fix briefs (gitignored — intermediate artifacts)
+│   └── stage-<N>-fix-brief.md
 └── logs/
     └── run-<timestamp>.jsonl
 
 monkey_devs/               # Python package
 ├── __init__.py
 ├── cli.py                 # Typer CLI entrypoint
-├── orchestrator.py        # compose_handoff(), load_registry(), render_stage_gate()
-├── graph.py               # LangGraph graph definition
+├── orchestrator.py        # compose_handoff(), load_registry(), render_stage_gate(), run_agentic_loop(), check_api_key_for_stage(), validate_artifacts()
+├── graph.py               # LangGraph graph definition (5 stage nodes + 5 correction branches + dispatch_stage3 + correction_limit_reached)
 ├── nodes/
 │   ├── concept_spec.py
 │   ├── architecture.py
 │   ├── implementation.py
 │   ├── code_fixing.py
-│   └── delivery.py
+│   ├── documentation.py
+│   ├── delivery.py
+│   └── review.py              # review_node() and fix_node() — shared across all stages
 ├── tools.py               # get_stage_tools(), bash allowlist validator
 ├── config.py              # load_config(), validate_config()
-├── tasks.py               # load_tasks(), dispatch_tasks(), update_task_status()
+├── tasks.py               # load_tasks(), dispatch_tasks(), update_task_status(), topological_sort(), validate_tasks_yaml()
 └── logger.py              # JSONL run log writer
 ```
 
@@ -677,6 +842,7 @@ The system exposes no network API. The sole interface is the CLI defined in Sect
 .opencode/workflow-state.db
 .opencode/logs/
 .opencode/config.yaml
+.opencode/review/
 ```
 
 Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitignored — they are project artifacts the user may want to version.
@@ -696,22 +862,45 @@ Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitigno
 **Prompt injection mitigation:**
 - All user-supplied text (project name, rejection reasons, task descriptions) is inserted into handoff messages as data fields, never concatenated into instruction text
 - Correction reasons are wrapped in explicit delimiters: `<user-rejection-reason>...</user-rejection-reason>`
-- Stage node system prompts include an explicit instruction to treat delimited user content as data, not instructions
+- Prior stage artifact content is wrapped in delimiters: `<prior-stage-output stage="N">...</prior-stage-output>`. The stage node system prompt includes an explicit instruction to treat all delimited content as read-only reference material, not as instructions.
+- Stage node system prompts include an explicit instruction to treat all delimited content as data, not instructions
 
 **Bash scope enforcement:**
 - Stage 3 and Stage 4 nodes receive an allowlist of permitted commands in their TOOLS block
-- Python CLI wraps shell execution in a command validator — commands not on the allowlist are blocked and logged
-- Default allowlist includes standard test runners only: `pytest`, `npm test`, `yarn test`, `cargo test`, `go test`, `make test`, `mvn test`
+- Python CLI `validate_bash_command(command)` enforces three checks in order:
+  1. Parse the full command string with `shlex.split()`. If parsing raises `ValueError` (unmatched quotes), reject.
+  2. Reject if any token or the raw string contains shell metacharacters: `;`, `&&`, `||`, `$()`, backticks, `|`, `>`, `<`, `&`.
+  3. Check the first token (the executable) against the allowlist.
+  Any check failure blocks the command and logs a `bash_blocked` event.
+- Default allowlist executables: `pytest`, `npm`, `yarn`, `cargo`, `go`, `make`, `mvn`, `python`, `python3`
 - No `sudo`, `rm`, `curl`, `wget`, or network commands on the allowlist
+
+**API key management:**
+- `config.yaml` stores env var names only (e.g. `api_key_env: ANTHROPIC_API_KEY`)
+- Python CLI reads keys via `os.environ` at runtime
+- `monkey-devs config validate` scans `config.yaml` for accidental key literals before any workflow operation and blocks execution if found
+- Key literal scanner regex patterns checked by `validate_config()`:
+  - OpenAI: `sk-[a-zA-Z0-9\-_]{20,}`
+  - Google: `AIza[0-9A-Za-z\-_]{35}`
+  - Anthropic: `sk-ant-[a-zA-Z0-9\-_]{90,}`
+- `check_api_key_for_stage(stage)` is called at the start of each stage node (before the LLM call) via `os.environ.get()`. If the required key is absent, the stage raises a clear error: `"<KEY_NAME> is not set. Set it and run 'monkey-devs resume'."` No network call is made.
+- `.opencode/config.yaml` is gitignored by default
+
+**Correction cycle limit:**
+- `config.workflow.max_corrections_per_stage` (default: 3) caps the number of correction cycles per stage
+- `WorkflowState.correction_counts` tracks cycles consumed per stage
+- When `correction_counts[stage] >= max_corrections_per_stage`, the graph routes to `correction_limit_reached` node instead of the correction branch. This node surfaces a blocking message to the user and calls `interrupt()` to pause the workflow for user intervention (user must run `monkey-devs reject` with a new strategy or manually edit artifacts before re-approving)
 
 **Threat model:**
 
 | Threat | Mitigation |
 |--------|------------|
-| API key leak via config file commit | Keys stored as env var references; `config.yaml` gitignored; `validate` command scans for literals |
+| API key leak via config file commit | Keys stored as env var references; `config.yaml` gitignored; `validate_config()` scans for key literals using known-format regexes |
 | Prompt injection via user input | User content wrapped in delimiters; stage nodes instructed to treat as data |
-| Bash scope creep by LLM | Python allowlist validator blocks non-permitted commands before execution |
+| Prompt injection via prior stage artifacts | Prior artifact content wrapped in `<prior-stage-output stage="N">` delimiters; stage nodes instructed to treat as read-only reference |
+| Bash scope creep by LLM | `validate_bash_command()`: `shlex.split()`, metacharacter rejection, first-token allowlist — all three layers before execution |
 | Accidental project file deletion | Stage permissions enforce write-path scoping per stage; no stage has unrestricted delete access |
+| Correction infinite loop | `correction_counts` tracked in state; `correction_limit_reached` node blocks further correction after `max_corrections_per_stage` |
 
 ---
 
@@ -721,7 +910,7 @@ Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitigno
 - Path: `.opencode/logs/run-<timestamp>.jsonl`
 - Format: one JSON object per line
 - Events: workflow lifecycle, stage transitions, skill injections, tool grants, LLM call completions, artifact writes, gate decisions, task dispatches
-- Retention: last 10 run logs kept; older logs deleted automatically by `monkey-devs init` and `monkey-devs run`
+- Retention: last 10 run logs kept; older logs deleted automatically by `monkey-devs init`, `monkey-devs run`, and `monkey-devs status` (rotation on `status` ensures cleanup occurs in every workflow session, not just at run time)
 
 **CLI output levels:**
 - Default (`monkey-devs run`): streams LLM output to terminal only
@@ -744,9 +933,10 @@ Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitigno
 
 - **Role**: Workflow state machine and durable state persistence
 - **Version**: LangGraph latest stable + `langgraph-checkpoint-sqlite`
-- **Integration point**: `graph.py` — defines the StateGraph with five stage nodes, five correction branches, and human interrupt points
+- **Integration point**: `graph.py` — defines the StateGraph with five primary stage nodes, one documentation sub-node (5a), five correction branches, two shared quality nodes (review, fix), and five gate interrupt points
 - **Failure mode**: If LangGraph fails mid-stage, SQLite checkpoint preserves state to the last completed node. `monkey-devs resume` restores from checkpoint.
-- **Interrupt pattern**: `interrupt()` called after each stage node completes. CLI waits for `approve` or `reject` command before calling `graph.invoke()` to resume.
+- **Interrupt pattern**: `interrupt()` called after the `fix_node` (or after the primary stage node when `review.enabled = false`). CLI stores the `thread_id` in `WorkflowState`. On `monkey-devs approve` or `monkey-devs reject`, the CLI calls `graph.invoke(Command(resume=value), config={"configurable": {"thread_id": thread_id}})` where `value` is `"approve"` or `"reject"`. The `thread_id` is loaded from the SQLite checkpoint.
+- **Graph shape**: `stage_N_node → review_node → fix_node → interrupt()` for Stages 1–4. Stage 5: `documentation_node → delivery_node → review_node → fix_node → interrupt()`. The `review_node` and `fix_node` are shared functions parameterized by `state["current_stage"]`.
 
 #### LiteLLM
 
@@ -758,35 +948,120 @@ Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitigno
 
 #### Stage Node Integration Pattern
 
+The agentic loop lives in `orchestrator.run_agentic_loop()` and is called by every stage node. The concept-spec node also wraps it in a multi-turn user input loop. The pattern below is the canonical reference for all stage nodes.
+
 ```python
+# orchestrator.py
+import asyncio, shlex
+import litellm
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
+
+async def run_agentic_loop(
+    messages: list[dict],
+    model: str,
+    tools: list[dict],
+    stage: int,
+    timeout_seconds: int,
+) -> str:
+    """
+    Execute the tool-calling agentic loop for a stage node.
+    Returns the final text response from the model.
+    Raises after 3 failed retry attempts.
+    """
+    MAX_RETRIES = 3
+
+    while True:
+        # --- retry with exponential backoff ---
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                stream = await asyncio.wait_for(
+                    litellm.acompletion(
+                        model=model,
+                        messages=messages,
+                        stream=True,
+                        tools=tools or None,
+                    ),
+                    timeout=timeout_seconds,
+                )
+                last_exc = None
+                break
+            except (RateLimitError, ServiceUnavailableError, OSError) as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+        if last_exc:
+            raise last_exc
+
+        # --- consume stream ---
+        response_content = ""
+        tool_calls: list = []
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                print(delta.content, end="", flush=True)
+                response_content += delta.content
+            if delta.tool_calls:
+                tool_calls.extend(delta.tool_calls)
+
+        # --- append assistant turn ---
+        messages.append({
+            "role": "assistant",
+            "content": response_content,
+            "tool_calls": tool_calls if tool_calls else None,
+        })
+
+        # --- final response: no tool calls ---
+        if not tool_calls:
+            return response_content
+
+        # --- execute tools and inject results ---
+        for tc in tool_calls:
+            result = await execute_tool(tc, stage=stage)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result),
+            })
+        # loop continues
+
+
+# nodes/concept_spec.py
 async def concept_spec_node(state: WorkflowState) -> WorkflowState:
-    # Orchestrator composes handoff (deterministic, no LLM)
+    check_api_key_for_stage(stage=1)
+
     handoff = compose_handoff(state, stage=1)
     tools = get_stage_tools(stage=1)
+    model = config.models["concept-spec"]
+    timeout = config.timeouts["concept-spec"]
 
-    # LiteLLM call with streaming
-    response = await litellm.acompletion(
-        model=config.models["concept-spec"],
-        messages=[{"role": "system", "content": handoff}],
-        stream=True,
-        tools=tools
-    )
+    # Stage 1 multi-turn conversational loop
+    messages = [{"role": "system", "content": handoff}]
+    final_response = ""
+    while True:
+        response = await run_agentic_loop(messages, model, tools, stage=1, timeout_seconds=timeout)
+        if "<intake-complete/>" in response:
+            final_response = response
+            break
+        # Print response was handled inside run_agentic_loop; prompt user for next input
+        user_input = input("\nYou: ")
+        messages.append({"role": "user", "content": user_input})
+        # run_agentic_loop already appended the assistant turn; add user turn and loop
 
-    # Stream to terminal and collect artifact
-    artifact_path = await stream_to_terminal(response, stage=1)
+    artifact_path = write_stage_artifact(final_response, stage=1, state=state)
 
-    # Log completion
-    log_event("llm_call_complete", stage=1, tokens_used=response.usage.total_tokens)
+    log_event("llm_call_complete", stage=1)
     log_event("artifact_written", stage=1, path=artifact_path)
 
-    # Update and return state
     return {
         **state,
-        "stage_outputs": {**state["stage_outputs"], 1: artifact_path},
+        "stage_outputs": {**state["stage_outputs"], 1: str(artifact_path)},
         "stage_statuses": {**state["stage_statuses"], 1: "complete"},
-        "stage_models": {**state["stage_models"], 1: config.models["concept-spec"]},
+        "stage_models": {**state["stage_models"], 1: model},
     }
 ```
+
+All other stage nodes (architecture, code_fixing, delivery) call `run_agentic_loop()` directly without the multi-turn user input wrapper. The implementation node additionally reads its `task_id` from the `Send()` input rather than from `state["current_task_index"]`.
 
 ---
 
@@ -814,6 +1089,13 @@ async def concept_spec_node(state: WorkflowState) -> WorkflowState:
 | IU-16 | CLI entrypoint | CLI (Typer) | All modules | `cli.py` with all commands | IU-10, IU-02, IU-09 |
 | IU-17 | Skill files (×15) | Markdown | DAD skill inventory | `.opencode/skills/*.md` | — |
 | IU-18 | Default registry + config | YAML | DAD schemas | `.opencode/registry.yaml`, `.opencode/config.yaml` | — |
+| IU-19 | Review node | Shared LangGraph node | Stage artifact + `adversarial-review` skill | Fix brief at `.opencode/review/stage-N-fix-brief.md`; `review_verdicts`, `review_brief_paths`, `review_skipped` in state | IU-06, IU-08, IU-10 |
+| IU-20 | Fix node | Shared LangGraph node | Fix brief + stage artifact path | Updated artifact written in place; skipped when `review_skipped[stage] = True` | IU-19 |
+| IU-21 | Documentation node | Stage node (5a) | Full codebase + `api-documentation`, `developer-guide-writing`, `docstring-writing` skills | `docs/api-reference.md`, `docs/developer-guide.md`, updated source files | IU-06, IU-07, IU-08 |
+| IU-22 | Adversarial-review skill | Skill file | — | `.opencode/skills/adversarial-review.md` | — |
+| IU-23 | API documentation skill | Skill file | — | `.opencode/skills/api-documentation.md` | — |
+| IU-24 | Developer guide skill | Skill file | — | `.opencode/skills/developer-guide-writing.md` | — |
+| IU-25 | Docstring skill | Skill file | — | `.opencode/skills/docstring-writing.md` | — |
 
 ### Generation Order
 
@@ -829,20 +1111,40 @@ Implement in this sequence to minimize blocking:
 8. **IU-06** — Handoff composer (depends on IU-03, IU-04)
 9. **IU-07** — Stage tool scoping + bash validator (depends on IU-03)
 10. **IU-11 through IU-15** — Stage nodes in parallel (all depend on IU-06, IU-07, IU-08)
-11. **IU-10** — LangGraph graph definition (depends on IU-04, IU-05, all stage nodes)
-12. **IU-16** — CLI entrypoint (depends on IU-10, IU-02, IU-09)
+11. **IU-22 through IU-25** — New skill files (no code dependencies, parallel with other skills)
+12. **IU-21** — Documentation node (depends on IU-06, IU-07, IU-08)
+13. **IU-19** — Review node (depends on IU-06, IU-08, IU-10)
+14. **IU-20** — Fix node (depends on IU-19)
+15. **IU-10** — LangGraph graph definition (depends on IU-04, IU-05, all stage nodes including IU-19–IU-21)
+16. **IU-16** — CLI entrypoint (depends on IU-10, IU-02, IU-09)
 
 ### Per-Unit Generation Notes
 
-**IU-06 (Handoff composer)**: Skill files are loaded and concatenated in `registry.yaml` order within the SKILLS block. Each skill is wrapped in `---\n## Skill: <name>\n<content>`. The `INSTRUCTIONS` block references skills by name and specifies their application order for the stage.
+**IU-06 (Handoff composer)**: Skill files are loaded and concatenated in `registry.yaml` order within the SKILLS block. Each skill is wrapped in `---\n## Skill: <name>\n<content>`. The `INSTRUCTIONS` block references skills by name and specifies their application order for the stage. Prior stage artifact content is injected into the CONTEXT block wrapped in `<prior-stage-output stage="N">...</prior-stage-output>` delimiters. Before returning the handoff string, `compose_handoff()` measures its character length and compares against `config.workflow.max_handoff_chars`. If exceeded, prior stage artifact content is truncated to first 8 000 + last 8 000 characters per artifact, with a `[...truncated...]` marker inserted at the cut point. The truncation is logged as a `handoff_truncated` event. No token counting is performed.
 
-**IU-07 (Bash validator)**: The allowlist is defined as a list of command prefixes (not full commands) — e.g. `pytest` matches `pytest tests/` and `pytest -v tests/unit/`. The validator splits the command string and checks the first token against the allowlist. Blocks and logs any non-matching command.
+**IU-07 (Stage tool scoping + bash validator)**: `get_stage_tools(stage)` returns fully-formed OpenAI-format schemas (see Data Layer "Tool Schemas") filtered by stage — not registry metadata strings. `validate_bash_command(command: str) -> None` enforces three sequential checks: (1) parse with `shlex.split(command)` — raise `BashValidationError` if `ValueError` (unmatched quotes); (2) reject if the raw command string or any token contains shell metacharacters `;`, `&&`, `||`, `$()`, backtick, `|`, `>`, `<`, `&`; (3) check `shlex.split(command)[0]` (the executable) against the allowlist set. Any check failure raises `BashValidationError`, logs a `bash_blocked` event, and returns the error message to the LLM as the `bash_execute` tool result so the model can recover.
 
-**IU-10 (LangGraph graph)**: Each stage has two nodes: `stage_N_node` (primary) and `stage_N_correction` (correction branch). The gate after each stage uses `interrupt()`. On resume, the CLI passes the gate decision (`approve` or `reject`) into the graph input. If `approve`, edge goes to `stage_N+1_node`. If `reject`, edge goes to `stage_N_correction`.
+**IU-10 (LangGraph graph)**: The graph contains: five primary stage nodes, one documentation sub-node (5a), five correction branch nodes, one `dispatch_stage3` router node, one `correction_limit_reached` node, two shared quality nodes (`review_node`, `fix_node`), and five gate interrupt points.
 
-**IU-13 (Implementation node)**: This node is invoked once per task by `dispatch_tasks()`. The `task_id` field in the handoff CONTEXT block specifies which task to implement. The node updates `tasks.yaml` status to `in-progress` on start and `done` on completion.
+Stage dispatch topology: after Stage 2 is approved, `dispatch_stage3` calls `topological_sort(state["tasks"])` and emits `Send("implementation_node", {"task_id": tid})` for each task in sorted order. LangGraph fans out; results merge automatically when all branches complete.
 
-**IU-16 (CLI)**: `monkey-devs config set-model` must check `WorkflowState.workflow_status` before writing. If `active`, raise a clear error: `"Cannot change model configuration during an active workflow. Run 'monkey-devs status' to see current state."` The `monkey-devs init` command must add `.opencode/config.yaml`, `.opencode/workflow-state.db`, and `.opencode/logs/` to `.gitignore`.
+Gate interrupt/resume: `interrupt()` is called after each primary stage node completes. The `thread_id` stored in `WorkflowState` is used for resume. On `monkey-devs approve` or `monkey-devs reject --reason "..."`, the CLI calls `graph.invoke(Command(resume=decision), config={"configurable": {"thread_id": thread_id}})`. The decision value is `"approve"` or `"reject"`.
+
+Correction routing: when a gate decision is `"reject"`, a conditional edge checks `state["correction_counts"][stage] >= config.workflow.max_corrections_per_stage`. If true, route to `correction_limit_reached` (which calls `interrupt()` with a blocking message). If false, increment `correction_counts[stage]` and route to `stage_N_correction`.
+
+The graph has no bypass edges — all five stage gates are mandatory.
+
+**IU-13 (Implementation node)**: This node is invoked once per task via LangGraph `Send()` fan-out from `dispatch_stage3`. The `task_id` is passed in the `Send()` payload, not read from `state["current_task_index"]`. The node constructs its handoff using `compose_handoff(state, stage=3, task_id=task_id)`, calls `run_agentic_loop()`, updates `tasks.yaml` status to `in-progress` on start and `done` on completion. `tasks.py` must expose `topological_sort(tasks: list[dict]) -> list[dict]` — called by `dispatch_stage3` before emitting `Send()` calls. If `topological_sort` detects a cycle in `depends_on` references, it raises `TaskCycleError` which surfaces as a blocking error at Stage 3 start before any implementation node runs.
+
+**IU-19 (Review node)**: `review_node(state)` in `nodes/review.py`. Reads `state["current_stage"]` to locate the stage artifact path from `state["stage_outputs"]`. Injects the `adversarial-review` skill and the artifact content into the handoff INSTRUCTIONS block. Calls `run_agentic_loop()` with `config.models["reviewer"]` and `config.timeouts["reviewer"]`. Parses the verdict line (`verdict: pass|warn|block`) from the response. On `pass`: sets `review_skipped[stage] = True`, sets `review_verdicts[stage] = "pass"`, returns — does not write a fix brief. On `warn` or `block`: writes the full response as `stage-N-fix-brief.md`, sets `review_brief_paths[stage]` and `review_verdicts[stage]`. When `config.review.enabled = false`, a conditional edge in `graph.py` routes directly from the primary stage node to `interrupt()`, bypassing both `review_node` and `fix_node`. `check_api_key_for_stage` checks the reviewer's provider key before the LLM call.
+
+**IU-20 (Fix node)**: `fix_node(state)` in `nodes/review.py` (same file as review node). First checks `state["review_skipped"].get(stage, False)` — if `True`, returns state unchanged immediately (no LLM call). Otherwise: loads the fix brief from `state["review_brief_paths"][stage]` and the original artifact from `state["stage_outputs"][stage]`. Composes a handoff with the fix brief as the INSTRUCTIONS block and the artifact content in CONTEXT. Calls `run_agentic_loop()` with `config.models["fixer"]` and `config.timeouts["fixer"]`. Writes updated artifact in place. For Stage 5, the artifact path points to `docs/` — the fix node rewrites whichever files the fix brief identifies. Logs `fix_applied` event on completion.
+
+**IU-21 (Documentation node)**: `documentation_node(state)` in `nodes/documentation.py`. Runs as Stage 5a, before `delivery_node`. Uses `config.models["fixer"]` (shared with Fix node — no new model key). Injects `api-documentation`, `developer-guide-writing`, and `docstring-writing` skills via `compose_handoff(state, stage=5, sub_stage="documentation")`. Has `filesystem_read` access to the full project and `filesystem_write` access to `docs/` and all source files. Must write `docs/api-reference.md` and `docs/developer-guide.md` as named artifacts. Inline docstring updates are written directly into source files via `filesystem_write` tool calls during the agentic loop. Records `stage_models["5a"] = config.models["fixer"]` in returned state. The downstream `delivery_node` records `stage_models["5b"] = config.models["delivery"]`.
+
+**IU-09 (Task manager)**: `tasks.py` exposes: `load_tasks()`, `update_task_status()`, `topological_sort(tasks)` (Kahn's algorithm; raises `TaskCycleError` on cycle), and `validate_tasks_yaml(path)`. `validate_tasks_yaml()` is called by the orchestrator after Stage 2 completes and before the Stage 2 gate is presented. It checks: valid YAML syntax, all required fields present (`id`, `title`, `status`, `depends_on`, `failure_classification`), `status` values are in `{pending, in-progress, done}`, `depends_on` entries reference valid task IDs. If validation fails, the orchestrator automatically triggers the Architecture correction branch (not a user rejection) with the validation error as the correction reason and logs a `tasks_validation_failed` event.
+
+**IU-16 (CLI)**: `monkey-devs approve` and `monkey-devs reject` load `thread_id` from the SQLite checkpoint (via `checkpointer.get(config)`) and call `graph.invoke(Command(resume=decision), config={"configurable": {"thread_id": thread_id}})`. The `decision` value is `"approve"` for `monkey-devs approve` and `"reject"` for `monkey-devs reject --reason "..."` (reason is stored to `WorkflowState.correction_reason` before resuming). `monkey-devs config set-model` must check `WorkflowState.workflow_status` before writing — if `active`, raise: `"Cannot change model configuration during an active workflow. Run 'monkey-devs status' to see current state."` `monkey-devs init` adds `.opencode/config.yaml`, `.opencode/workflow-state.db`, and `.opencode/logs/` to `.gitignore`. `monkey-devs resume` checks for `.opencode/` in the current directory; if absent and `--project-path` was not provided, prints: `"No .opencode/ directory found. Run from your project directory or pass --project-path."` `monkey-devs resume` calls `validate_artifacts(state)` before proceeding — if any `stage_outputs` path is missing, it surfaces: `"Stage N artifact missing at <path>. Re-run that stage before resuming."`
 
 ---
 
@@ -915,10 +1217,28 @@ Implement in this sequence to minimize blocking:
 
 - **Status**: Accepted
 - **Context**: FR-37 requires per-stage model configuration. User specified vendor assignments per stage.
-- **Decision**: Gemini 2.5 Pro for Stages 1–2, Claude Opus 4.6 for Stage 3, Codex Mini for Stage 4, Claude Sonnet 4.6 for Stage 5.
-- **Rationale**: Gemini 2.5 Pro's large context window suits intake and architecture. Opus 4.6 is the highest-quality model for complex code generation. Codex Mini is purpose-built for code understanding and repair. Sonnet 4.6 is fast and capable for documentation work.
+- **Decision**: Gemini 2.5 Pro for Stages 1–2, Claude Opus 4.6 for Stage 3, `openai/o4-mini` for Stage 4, Claude Sonnet 4.6 for Stage 5.
+- **Rationale**: Gemini 2.5 Pro's large context window suits intake and architecture. Opus 4.6 is the highest-quality model for complex code generation. `o4-mini` is a confirmed OpenAI model with strong code reasoning at lower cost than GPT-4o. Sonnet 4.6 is fast and capable for documentation work. (`openai/codex-mini` was removed — this model name does not appear in the OpenAI API model list.)
 - **Alternatives considered**: Single model for all stages (cheaper but lower quality for specialized work)
 - **Consequences**: Three provider API keys required (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). `monkey-devs config validate` must check all three before workflow start.
+
+### ADR-009: Autonomous Review→Fix Loop Before Every Stage Gate
+
+- **Status**: Accepted
+- **Context**: Stage outputs are produced by LLM agents and may contain structural errors, missing sections, or logic gaps that the user should not have to manually identify. The existing correction branch handles user-driven fixes but does not prevent avoidable defects from reaching the gate.
+- **Decision**: A shared `review_node` + `fix_node` pair runs automatically after every primary stage node, before `interrupt()`. The review agent produces a structured fix brief; the fix agent rewrites the artifact. The user always sees the post-fix artifact at the gate.
+- **Rationale**: Separating review from production (different model, different node) maximizes adversarial value — the model that produced the artifact does not also judge it. A single pass keeps latency bounded. The human gate immediately after is the final check. The `pass` bypass ensures the fix node adds zero cost when the artifact is already clean.
+- **Alternatives considered**: Review inside the stage node (same model, lower adversarial value); user-invoked `monkey-devs review` command (optional, defeats the purpose); review loop with iteration ceiling (higher cost, marginal quality gain given the human gate).
+- **Consequences**: Two new shared nodes in the graph. Two new model config keys (`reviewer`, `fixer`). `.opencode/review/` directory added and gitignored. `WorkflowState` gains three new fields.
+
+### ADR-010: Documentation Node as Stage 5a, Reusing Fixer Model
+
+- **Status**: Accepted
+- **Context**: The Delivery node (Stage 5) produces user-facing documentation (README, delivery summary) but does not produce technical reference documentation (API reference, developer guide, inline docstrings). A documentation agent was requested to fill this gap.
+- **Decision**: A `documentation_node` runs as Stage 5a, before the existing Delivery node (now Stage 5b). It uses the `fixer` model (`google/gemini-2.5-pro`) — already configured for large-context rewrites — rather than adding a new model config key. Both sub-nodes are covered by the single Stage 5 gate. The review→fix pair (ADR-009) applies to the combined Stage 5 output.
+- **Rationale**: Embedding documentation in Stage 5 avoids adding a mandatory Stage 6, preserving the five-gate workflow contract (FR-22). The `fixer` model's large context window is well-suited for reading a full codebase and generating comprehensive reference docs. No new model key keeps the config minimal.
+- **Alternatives considered**: Stage 6 with its own gate (breaks FR-22); parallel per-task documentation during Stage 3 (documentation quality degrades against incomplete codebase); separate `monkey-devs document` command (not integrated into the workflow guarantee).
+- **Consequences**: `stage_models` gains `"5a"` and `"5b"` sub-keys. Three new skill files required. `nodes/documentation.py` added. Stage 5 gate summary must present both documentation and delivery artifacts.
 
 ---
 
@@ -946,15 +1266,15 @@ Implement in this sequence to minimize blocking:
 5. IU-06, IU-07 — Handoff composer + tool scoping (complete the orchestration layer)
 
 **Blocking items before generation can start:**
-- None. All open decisions are resolved. The INSTRUCTIONS block templates for each stage node are the only content items not yet written, but they do not block scaffold and module generation — they can be written in parallel with IU-01 through IU-09.
+- None. All critical, high, and medium design defects identified in the 2026-04-14 adversarial review have been resolved (v1.1). The adversarial review loop and documentation agent have been fully specified (v1.2). The INSTRUCTIONS block templates for each stage node and the content of the four new skill files (IU-22 through IU-25) are the only items not yet written, but they do not block scaffold and module generation — they can be written in parallel with IU-01 through IU-09.
 
 ---
 
 ## Ready for Implementation
 
 **DAD file**: `docs/design/design-monkey-devs.md`
-**Spec file**: `docs/specs/spec-monkey-devs.md` (finalized, v1.0)
-**Status**: Approved for generation
+**Spec file**: `docs/specs/spec-monkey-devs.md` (finalized, v1.2)
+**Status**: Approved for generation (v1.2 — adversarial review loop + documentation agent added)
 
 **Implementation units**:
 - IU-01: Python package scaffold — structure — ready
@@ -975,6 +1295,13 @@ Implement in this sequence to minimize blocking:
 - IU-16: CLI entrypoint — CLI — needs IU-10
 - IU-17: Skill files (×15) — markdown — ready to write
 - IU-18: Default registry + config — YAML — ready to write
+- IU-19: Review node — shared LangGraph node — ready
+- IU-20: Fix node — shared LangGraph node — ready (needs IU-19)
+- IU-21: Documentation node — stage node (5a) — ready
+- IU-22: Adversarial-review skill — markdown — ready to write
+- IU-23: API documentation skill — markdown — ready to write
+- IU-24: Developer guide skill — markdown — ready to write
+- IU-25: Docstring skill — markdown — ready to write
 
 **Recommended generation order**: IU-01 → IU-04, IU-08 → IU-02, IU-03 → IU-17, IU-18 → IU-06, IU-07 → IU-09 → IU-11–IU-15 → IU-10 → IU-16
 

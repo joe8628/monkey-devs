@@ -1,14 +1,15 @@
 # Technical Specification: Monkey Devs
 
-**Version**: 1.1
-**Date**: 2026-04-14
+**Version**: 1.2
+**Date**: 2026-04-15
 **Status**: Finalized — architecture complete
-**Sources**: `docs/concepts/monkey-devs.md` v1.1 (concept document)
-**Design**: `docs/design/design-monkey-devs.md` v1.0 (all open decisions resolved)
+**Sources**: `docs/concepts/monkey-devs.md` v1.2 (concept document)
+**Design**: `docs/design/design-monkey-devs.md` v1.2 (all open decisions resolved)
 
 **Changelog**:
 - v1.0 (2026-04-14): Initial draft, ready for architecture
 - v1.1 (2026-04-14): Updated to reflect architectural decisions — IDE dependency removed, Python CLI model adopted, OpenCode references replaced with Python CLI + LangGraph model, FR-37–FR-39 added for multi-vendor model configuration, all open decisions (OD-01–OD-05) resolved, all constraints and assumptions updated
+- v1.2 (2026-04-15): FR-40–FR-44 added for autonomous adversarial review loop and documentation agent; Stage 4 model corrected to `openai/o4-mini`; Stage 5 split into 5a (documentation) and 5b (delivery); WorkflowState, skills inventory, and CLI table updated
 
 ---
 
@@ -69,12 +70,15 @@ No additional roles, permissions model, or multi-user support is in scope.
 
 ### 5.2 Stage Nodes — LangGraph Async Functions
 
-- **FR-08**: The system MUST provide five pre-defined stage nodes as async Python functions in the LangGraph graph:
+- **FR-08**: The system MUST provide the following async Python node functions in the LangGraph graph:
   - `concept_spec_node` — Concept & Spec (model: `google/gemini-2.5-pro`)
   - `architecture_node` — Architecture & Task Management (model: `google/gemini-2.5-pro`)
-  - `implementation_node` — Implementation & Code Generation (model: `anthropic/claude-opus-4-6`)
-  - `code_fixing_node` — Code Fixing & Test Categorization (model: `openai/codex-mini`)
-  - `delivery_node` — Delivery (model: `anthropic/claude-sonnet-4-6`)
+  - `implementation_node` — Implementation & Code Generation (model: `anthropic/claude-opus-4-6`; invoked once per task via `Send()`)
+  - `code_fixing_node` — Code Fixing & Test Categorization (model: `openai/o4-mini`)
+  - `documentation_node` — Documentation (Stage 5a; model: `google/gemini-2.5-pro`)
+  - `delivery_node` — Delivery (Stage 5b; model: `anthropic/claude-sonnet-4-6`)
+  - `review_node` — Adversarial Review (shared; model: `anthropic/claude-opus-4-6`; runs after every primary stage node)
+  - `fix_node` — Artifact Fix (shared; model: `google/gemini-2.5-pro`; runs after `review_node` when verdict is not `pass`)
 - **FR-09**: Stage nodes MUST be invoked automatically by the orchestrator at the appropriate stage via LangGraph graph edges.
 - **FR-10**: Stage nodes MUST receive a structured handoff message as their system prompt. The handoff message MUST follow the four-block schema: `CONTEXT` (project name, stage, task_id, prior_output) / `SKILLS` (full injected skill file content, named and delimited) / `TOOLS` (tool name + scoped instruction) / `INSTRUCTIONS` (stage directive and rejection reason if correction branch).
 - **FR-11**: Stage nodes MUST NOT self-configure — they MUST rely entirely on the handoff message composed by the Python CLI for their skill and tool context.
@@ -89,7 +93,8 @@ No additional roles, permissions model, or multi-user support is in scope.
 - **FR-17**: Stage 3 — Implementation: The node MUST write both production code and tests using the `tdd-implementation` and `code-generation` skills. Tests MUST be written as part of this stage, not deferred. The node is invoked once per task unit by the orchestrator's task-dispatch logic.
 - **FR-18**: Stage 4 — Code Fixing: The node MUST run all tests and attempt to fix failing tests automatically. Any failures it cannot resolve MUST be explicitly classified as either `code-issue` or `test-issue` in `tasks.yaml` before the stage gate. It MUST NOT silently drop, skip, or weaken tests.
 - **FR-19**: Stage 4 — Code Fixing: The classification of unresolved failures MUST be presented to the user at the stage gate with a rationale for each classification.
-- **FR-20**: Stage 5 — Delivery: The node MUST produce `README.md` and `docs/delivery.md`. It MUST surface a delivery summary listing what was built and where relevant files are located.
+- **FR-20**: Stage 5a — Documentation: The `documentation_node` MUST produce `docs/api-reference.md` (endpoint/schema reference), `docs/developer-guide.md` (setup, test, and module structure guide), and inline docstrings written into source files. It MUST have `filesystem_read` access to the full project and `filesystem_write` access to `docs/` and all source files.
+- **FR-20b**: Stage 5b — Delivery: The `delivery_node` MUST produce `README.md` and `docs/delivery.md`. It MUST surface a delivery summary listing what was built and where relevant files are located. It runs after `documentation_node` and shares the Stage 5 gate.
 
 ### 5.4 Human Approval Gates
 
@@ -122,7 +127,18 @@ No additional roles, permissions model, or multi-user support is in scope.
 - **FR-35**: The Architecture node MUST make the final, binding stack decision at Stage 2. This decision MUST be recorded in `docs/architecture.md` and communicated to the user at the Stage 2 gate.
 - **FR-36**: No fixed or default stack MAY be imposed by the system. Stack selection is always per-project.
 
-### 5.9 Multi-Vendor Model Configuration
+### 5.9 Autonomous Adversarial Review Loop
+
+- **FR-40**: After every primary stage node completes and before the stage gate is presented, the system MUST automatically run a `review_node` that critiques the stage artifact using the `adversarial-review` skill and produces a structured fix brief at `.opencode/review/stage-N-fix-brief.md`. The fix brief MUST include a verdict (`pass | warn | block`) and a ranked issue list (critical → high → medium), each issue with a concrete fix instruction.
+- **FR-41**: When the review verdict is `pass`, the system MUST skip the `fix_node` entirely and proceed directly to the stage gate. No fix brief is written.
+- **FR-42**: When the review verdict is `warn` or `block`, the system MUST run `fix_node` which rewrites the stage artifact in place using the fix brief as its sole instruction set. The gate MUST display the review verdict and a fix brief summary alongside the standard approval options.
+- **FR-43**: The review→fix loop MUST be bypassable via `config.review.enabled: false`. When disabled, `review_node` and `fix_node` are skipped for all stages.
+
+### 5.10 Documentation Agent
+
+- **FR-44**: Stage 5 MUST execute a `documentation_node` (5a) before the `delivery_node` (5b). The documentation node MUST produce `docs/api-reference.md`, `docs/developer-guide.md`, and inline docstrings written into source files. Both sub-nodes are covered by the single Stage 5 gate. The review→fix pair evaluates the combined Stage 5 output before the gate.
+
+### 5.11 Multi-Vendor Model Configuration
 
 - **FR-37**: Each stage node MUST have an independently configurable LLM model. Models MAY be from different vendors. Configuration is stored in `.opencode/config.yaml` using LiteLLM model string format (`provider/model-id`).
 - **FR-38**: Model configuration MUST be defined before a workflow starts and MAY only be updated before starting or after a workflow completes. `monkey-devs config set-model` MUST be blocked with a clear error message during an active workflow.
@@ -135,8 +151,11 @@ No additional roles, permissions model, or multi-user support is in scope.
 | Concept & Spec | `google/gemini-2.5-pro` | Large context window for long intake conversations; strong reasoning for requirements |
 | Architecture | `google/gemini-2.5-pro` | Handles full project context for system design |
 | Implementation | `anthropic/claude-opus-4-6` | Highest code generation quality for production code + tests |
-| Code Fixing | `openai/codex-mini` | Purpose-built for code understanding and repair |
-| Delivery | `anthropic/claude-sonnet-4-6` | Fast and precise for documentation and delivery summary |
+| Code Fixing | `openai/o4-mini` | Confirmed OpenAI model; strong code reasoning at lower cost than GPT-4o |
+| Documentation (5a) | `google/gemini-2.5-pro` | Large context window for full-codebase reference doc generation; reuses fixer model |
+| Delivery (5b) | `anthropic/claude-sonnet-4-6` | Fast and precise for README and delivery summary |
+| Reviewer (all stages) | `anthropic/claude-opus-4-6` | Strong critical reasoning for adversarial artifact critique |
+| Fixer (all stages) | `google/gemini-2.5-pro` | Large context window for full-artifact rewrites |
 
 ---
 
@@ -159,13 +178,14 @@ Monkey Devs is a standalone Python CLI application. It does not require an IDE, 
 
 **Inside the system boundary:**
 - `monkey-devs` Python CLI package (`monkey_devs/`)
-- LangGraph workflow graph (five stage nodes + five correction branches + interrupt points)
+- LangGraph workflow graph (five primary stage nodes + documentation sub-node + two shared quality nodes + five correction branches + interrupt points)
 - Python CLI orchestrator (deterministic control loop — no LLM)
 - Resource registry (`.opencode/registry.yaml`)
 - Model and provider config (`.opencode/config.yaml`)
-- Skill files (`.opencode/skills/*.md`) — 15 files
+- Skill files (`.opencode/skills/*.md`) — 19 files
 - LangGraph SQLite state (`.opencode/workflow-state.db`)
 - Task file (`.opencode/tasks.yaml`)
+- Review fix briefs (`.opencode/review/stage-N-fix-brief.md`) — gitignored
 - Run logs (`.opencode/logs/run-<timestamp>.jsonl`)
 
 **Outside the system boundary (dependencies):**
@@ -190,8 +210,11 @@ Monkey Devs is a standalone Python CLI application. It does not require an IDE, 
 | Stage Gate | A CLI pause point after each stage. LangGraph `interrupt()` halts execution. CLI renders summary + options. Resumes on `monkey-devs approve` or `monkey-devs reject`. |
 | Handoff Message | A four-block markdown message (CONTEXT / SKILLS / TOOLS / INSTRUCTIONS) composed by the Python CLI and used as the LLM system prompt for a stage node invocation. |
 | Workflow | The five-stage LangGraph pipeline instance for a specific project. Persisted in SQLite. Resumable after interruption. |
-| Correction Branch | A paired LangGraph node for each stage. Activated on rejection — carries rejection reason and prior output, re-invokes the same stage node with updated context. |
-| Task | A unit of implementation work in `.opencode/tasks.yaml`. Created by Stage 2. Dispatched by Python CLI to individual Implementation nodes in Stage 3. |
+| Correction Branch | A paired LangGraph node for each stage. Activated on rejection — carries rejection reason and prior output, re-invokes the same stage node with updated context. Capped at `max_corrections_per_stage`. |
+| Task | A unit of implementation work in `.opencode/tasks.yaml`. Created by Stage 2. Dispatched to individual Implementation nodes via LangGraph `Send()` after topological sort of `depends_on` relationships. |
+| Review Node | A shared async LangGraph node that runs after every primary stage node. Critiques the stage artifact using the `adversarial-review` skill. Produces a fix brief with a `pass | warn | block` verdict. |
+| Fix Node | A shared async LangGraph node that runs after `review_node` when verdict is not `pass`. Rewrites the stage artifact in place using the fix brief as its instruction set. Skipped when verdict is `pass`. |
+| Fix Brief | A structured markdown document at `.opencode/review/stage-N-fix-brief.md`. Contains a verdict and a ranked issue list with concrete fix instructions per issue. |
 
 ### 8.2 Core Entities
 
@@ -204,17 +227,23 @@ class WorkflowState(TypedDict):
     current_stage: int                       # 1–5
     workflow_status: str                     # active | completed | interrupted
     stage_statuses: dict[int, str]           # pending | active | complete | approved | rejected
-    stage_outputs: dict[int, str]            # path to artifact per stage
-    stage_models: dict[int, str]             # model used per stage (audit trail)
+    stage_outputs: dict[int, str]            # absolute path to artifact per stage
+    stage_models: dict[int, str]             # model used per stage; Stage 5 uses "5a" and "5b" sub-keys
     correction_active: bool
     correction_stage: int | None
     correction_reason: str | None
     tasks: list[str]                         # task IDs from tasks.yaml
     tasks_dispatched: list[str]
     tasks_completed: list[str]
+    current_task_index: int                  # index into tasks[] for Stage 3 Send() fan-out
     gate_decisions: dict[int, str]           # approved | fix | rejected
     allocated_skills: dict[int, list[str]]
     allocated_tools: dict[int, list[str]]
+    thread_id: str                           # LangGraph thread ID for interrupt/resume
+    correction_counts: dict[int, int]        # correction cycles consumed per stage
+    review_verdicts: dict[int, str]          # pass | warn | block per stage
+    review_brief_paths: dict[int, str]       # absolute path to fix brief per stage
+    review_skipped: dict[int, bool]          # True when review verdict was pass
 ```
 
 **Task (tasks.yaml entry)**
@@ -263,7 +292,7 @@ class WorkflowState(TypedDict):
 | `monkey-devs status` | Show workflow state, current stage, task list |
 | `monkey-devs approve` | Approve current stage gate, advance to next stage |
 | `monkey-devs reject --reason "..."` | Reject current stage, route to correction branch |
-| `monkey-devs resume` | Resume an interrupted workflow from last SQLite checkpoint |
+| `monkey-devs resume [--project-path PATH]` | Resume an interrupted workflow from last SQLite checkpoint. Prints a helpful error if no `.opencode/` directory is found and `--project-path` is not provided. |
 | `monkey-devs details` | Show full allocation log for current stage (reads JSONL run log) |
 | `monkey-devs tasks` | List tasks and status (Stage 3+) |
 | `monkey-devs registry` | Show resource registry contents |
@@ -345,9 +374,9 @@ prior_output: [artifact path | "none"]
 
 ## Ready for Implementation
 
-**Spec file**: `docs/specs/spec-monkey-devs.md` v1.1 — Finalized
-**Concept file**: `docs/concepts/monkey-devs.md` v1.1 — Architecture Complete
-**Design file**: `docs/design/design-monkey-devs.md` v1.0 — Approved for generation
+**Spec file**: `docs/specs/spec-monkey-devs.md` v1.2 — Finalized
+**Concept file**: `docs/concepts/monkey-devs.md` v1.2 — Architecture Complete
+**Design file**: `docs/design/design-monkey-devs.md` v1.2 — Approved for generation
 
 All open decisions resolved. All assumptions confirmed or eliminated. No blockers.
-See `docs/design/design-monkey-devs.md` Part III for implementation units and generation order.
+See `docs/design/design-monkey-devs.md` Part III for implementation units and generation order (IU-01 through IU-25).

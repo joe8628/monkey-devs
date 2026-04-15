@@ -3,11 +3,12 @@
 **Status**: ARCHITECTURE COMPLETE
 **Complexity**: COMPLEX
 **Created**: 2026-04-14
-**Updated**: 2026-04-14
-**Version**: 1.1
+**Updated**: 2026-04-15
+**Version**: 1.2
 **Changelog**:
 - v1.0 (2026-04-14): Initial concept, ready for architecture
 - v1.1 (2026-04-14): Updated to reflect architectural decisions — IDE dependency removed, Python CLI model adopted, OpenCode references replaced, all open questions resolved
+- v1.2 (2026-04-15): Added autonomous adversarial review loop (review_node + fix_node before every gate), documentation agent (Stage 5a), corrected Stage 4 model to `openai/o4-mini`
 
 ---
 
@@ -15,14 +16,18 @@
 
 A solo-operator agentic development system that replaces a full-stack development team. The user describes what they want to build via a command-line interface, and a LangGraph-orchestrated pipeline of specialized AI agents — each equipped with domain-specific skills — handles decomposition, design, implementation, and delivery. The user participates at five defined checkpoints: reviewing and approving each stage before execution continues, or intervening to fix/redirect the plan. Target output is working software, covering both internal tools/scripts and full applications.
 
-The system runs as a standalone Python CLI (`monkey-devs`) with no IDE dependency. A deterministic Python control loop handles orchestration (resource allocation, skill injection, task dispatch) — no LLM tokens are consumed for orchestration. LLM calls happen only inside the five stage nodes, each powered by a purpose-selected model via LiteLLM.
+The system runs as a standalone Python CLI (`monkey-devs`) with no IDE dependency. A deterministic Python control loop handles orchestration (resource allocation, skill injection, task dispatch) — no LLM tokens are consumed for orchestration. LLM calls happen only inside the stage nodes, each powered by a purpose-selected model via LiteLLM.
+
+Before every stage gate, an **autonomous adversarial review loop** runs: a review agent critiques the stage output, produces a structured fix brief, and a fix agent rewrites the artifact to address all issues — so the user always sees a self-corrected output at each checkpoint.
 
 The five workflow stages are:
 1. **Concept & Spec** — Gemini 2.5 Pro conducts conversational intake and produces concept + requirements spec
 2. **Architecture & Task Management** — Gemini 2.5 Pro designs the system and produces a task breakdown in `.opencode/tasks.yaml`
 3. **Implementation & Code Generation** — Claude Opus 4.6 writes production code and tests, one task unit at a time
-4. **Code Fixing & Test Categorization** — Codex Mini runs tests, fixes failures, classifies unresolved failures as `code-issue` or `test-issue`
-5. **Delivery** — Claude Sonnet 4.6 finalizes the repository and produces a delivery summary
+4. **Code Fixing & Test Categorization** — `o4-mini` runs tests, fixes failures, classifies unresolved failures as `code-issue` or `test-issue`
+5. **Documentation + Delivery** — Gemini 2.5 Pro generates API reference, developer guide, and inline docstrings (Stage 5a); Claude Sonnet 4.6 finalizes the README and delivery summary (Stage 5b)
+
+Each stage is followed by the review→fix pair before the user gate.
 
 ---
 
@@ -36,8 +41,9 @@ The five workflow stages are:
 - **Resource registry**: `.opencode/registry.yaml` — YAML manifest listing all skills and tools with `name`, `description`, `stages`, and type-specific fields. Read by the Python CLI at workflow start.
 - **Stage nodes**: Five async Python functions in the LangGraph graph, each powered by a specific LLM model via LiteLLM. Receive handoff messages as system prompts. Stream output to terminal. Write artifacts to filesystem.
 - **Multi-vendor models**: Each stage node uses a purpose-selected model. Configurable in `.opencode/config.yaml`. Locked during active workflows; updatable before start or after completion.
-- **Task dispatch**: After Stage 2 approval, Python CLI reads `.opencode/tasks.yaml` and spawns one Implementation node per task unit. Enables parallel or sequential task-level execution.
-- **Correction branches**: Each stage has a paired LangGraph correction branch node. Rejection writes reason + prior output to state, routes to the correction branch, re-invokes the stage node with updated context.
+- **Task dispatch**: After Stage 2 approval, Python CLI reads `.opencode/tasks.yaml`, runs topological sort on `depends_on` relationships, and fans out one Implementation node per task unit via LangGraph `Send()`.
+- **Autonomous adversarial review loop**: After every primary stage node, a shared `review_node` (Claude Opus 4.6) critiques the artifact using the `adversarial-review` skill and produces a structured fix brief (verdict: `pass | warn | block`, ranked issue list). If verdict is `pass`, the fix node is skipped entirely. Otherwise, a shared `fix_node` (Gemini 2.5 Pro) rewrites the artifact in place. The user always sees the post-fix artifact at the gate. Bypassable via `config.review.enabled: false`.
+- **Correction branches**: Each stage has a paired LangGraph correction branch node. Rejection writes reason + prior output to state, routes to the correction branch, re-invokes the stage node with updated context. Capped at `max_corrections_per_stage` (default: 3).
 - **Human-in-the-loop**: LangGraph `interrupt()` pauses execution at each stage gate. CLI renders a compact summary (sub-agent name, skills/tools used, unresolved issues, three options). `monkey-devs details` expands full allocation log from JSONL run log.
 - **Workflow persistence**: LangGraph SQLite checkpointer at `.opencode/workflow-state.db`. Survives process crashes. `monkey-devs resume` restores from last checkpoint.
 - **Scope**: Both internal tools/scripts and full applications (web apps, APIs, mobile).
@@ -81,26 +87,30 @@ The five workflow stages are:
 **Status**: RESOLVED
 
 - **Python CLI as orchestrator**: no LLM, reads registry, composes handoffs, dispatches tasks, renders gates
-- **Five LangGraph stage nodes** (async Python functions): each invokes LiteLLM with a handoff message as system prompt
+- **Five primary LangGraph stage nodes** (async Python functions): each invokes LiteLLM with a handoff message as system prompt
   - `concept_spec_node` — `google/gemini-2.5-pro`
   - `architecture_node` — `google/gemini-2.5-pro`
-  - `implementation_node` — `anthropic/claude-opus-4-6` (one per task unit)
-  - `code_fixing_node` — `openai/codex-mini`
-  - `delivery_node` — `anthropic/claude-sonnet-4-6`
+  - `implementation_node` — `anthropic/claude-opus-4-6` (one per task unit via `Send()`)
+  - `code_fixing_node` — `openai/o4-mini`
+  - `documentation_node` (Stage 5a) — `google/gemini-2.5-pro` (fixer model)
+  - `delivery_node` (Stage 5b) — `anthropic/claude-sonnet-4-6`
+- **Two shared quality nodes** — run after every primary stage node, before the gate:
+  - `review_node` — `anthropic/claude-opus-4-6`; produces fix brief at `.opencode/review/stage-N-fix-brief.md`
+  - `fix_node` — `google/gemini-2.5-pro`; rewrites artifact from fix brief; skipped on `pass` verdict
 - **Five correction branch nodes** — paired with each stage node; activated on user rejection
 - Tool permissions enforced by Python code (`get_stage_tools()` + bash allowlist validator), not IDE config
 
 ### 3. Skills & Tools System
 **Status**: RESOLVED
 
-- **15 skill files** in `.opencode/skills/` — markdown prompt files injected into stage node system prompts
-- **Orchestrator skills** (stage 0): `resource-allocation`, `stage-gate`, `handoff-composer`, `task-dispatch`
+- **19 skill files** in `.opencode/skills/` — markdown prompt files injected into stage node system prompts
+- **Orchestrator skills** (stage 0): `resource-allocation`, `stage-gate`, `handoff-composer`, `task-dispatch`, `adversarial-review`
 - **Stage 1 skills**: `conversational-intake`, `requirements-writing`, `stack-evaluation`
 - **Stage 2 skills**: `system-design`, `task-decomposition`, `adr-writing`, `stack-decision`
 - **Stage 3 skills**: `tdd-implementation`, `code-generation`
 - **Stage 4 skills**: `test-categorization`, `systematic-debugging`
-- **Stage 5 skills**: `delivery-summary`, `readme-writing`
-- **Tools**: Python-native file I/O and bash (allowlisted). Optional `web-search` MCP for Stages 1–2.
+- **Stage 5 skills**: `api-documentation`, `developer-guide-writing`, `docstring-writing`, `delivery-summary`, `readme-writing`
+- **Tools**: Python-native file I/O (`filesystem_read`, `filesystem_write`, `filesystem_list`) and bash (`bash_execute`, allowlisted). Optional `web-search` MCP for Stages 1–2.
 - **Allocation rule**: Skill if text/decision operation; tool only if execution required (binary, enforced by Python code)
 
 ### 4. Task Intake
@@ -113,19 +123,20 @@ The five workflow stages are:
 ### 5. Stage Gates
 **Status**: RESOLVED
 
-- LangGraph `interrupt()` pauses after each stage node completes
-- CLI renders: stage name, model used, skills/tools summary, unresolved issues, three options (approve / fix+continue / reject+redirect)
-- `monkey-devs approve` → advances to next stage node
-- `monkey-devs reject --reason "..."` → routes to correction branch, re-invokes current stage with rejection context
+- After each primary stage node: `review_node` runs → if verdict is not `pass`, `fix_node` rewrites the artifact → then `interrupt()` presents the gate
+- CLI renders: stage name, models used, skills/tools summary, review verdict + fix brief summary (if warn/block), unresolved issues, three options (approve / fix+continue / reject+redirect)
+- `monkey-devs approve` → calls `graph.invoke(Command(resume="approve"), config={"configurable": {"thread_id": thread_id}})` → advances to next stage
+- `monkey-devs reject --reason "..."` → routes to correction branch, re-invokes current stage with rejection context; capped at `max_corrections_per_stage`
 - `monkey-devs details` → full allocation log from JSONL run log (drill-down on request)
 - `monkey-devs fix` path: workflow continues from current stage with updated output — no restart from Stage 1
 
 ### 6. Output & Delivery
 **Status**: RESOLVED
 
-- Delivery = working code in a local repo, ready to run
-- `delivery-summary` skill produces `docs/delivery.md` listing what was built and where files live
-- `readme-writing` skill produces `README.md` with setup and run instructions
+- Delivery = working code in a local repo, ready to run, with full technical documentation
+- **Stage 5a (Documentation)**: `api-documentation` skill produces `docs/api-reference.md`; `developer-guide-writing` skill produces `docs/developer-guide.md`; `docstring-writing` skill writes inline documentation into source files
+- **Stage 5b (Delivery)**: `delivery-summary` skill produces `docs/delivery.md` listing what was built and where files live; `readme-writing` skill produces `README.md` with setup and run instructions
+- Both sub-nodes are covered by a single Stage 5 gate (after the review→fix pair evaluates the combined output)
 - Deployment is out of scope — handled manually by the user
 
 ---
@@ -154,11 +165,11 @@ All open questions resolved. See Architecture Decision Records in `docs/design/d
 
 ## Architecture Complete
 
-**Concept file**: `docs/concepts/monkey-devs.md` v1.1
-**Spec file**: `docs/specs/spec-monkey-devs.md` v1.1
-**Design file**: `docs/design/design-monkey-devs.md` v1.0
+**Concept file**: `docs/concepts/monkey-devs.md` v1.2
+**Spec file**: `docs/specs/spec-monkey-devs.md` v1.2
+**Design file**: `docs/design/design-monkey-devs.md` v1.2
 
-**System in one sentence**: `monkey-devs` is a standalone Python CLI that drives a LangGraph pipeline of five LiteLLM-powered stage nodes — Gemini for intake and architecture, Opus for implementation, Codex for fixing, Sonnet for delivery — with deterministic Python orchestration, SQLite persistence, and human approval gates at every stage boundary.
+**System in one sentence**: `monkey-devs` is a standalone Python CLI that drives a LangGraph pipeline of five LiteLLM-powered stage nodes — Gemini for intake, architecture, and documentation, Opus for implementation and adversarial review, `o4-mini` for code fixing, Sonnet for delivery — with an autonomous review→fix quality loop before every human gate, deterministic Python orchestration, SQLite persistence, and five mandatory approval checkpoints.
 
 **Confirmed decisions**:
 - Standalone Python CLI — no IDE dependency (ADR-007)
@@ -168,9 +179,11 @@ All open questions resolved. See Architecture Decision Records in `docs/design/d
 - Correction branches per stage for rejection handling (ADR-003)
 - YAML resource registry (ADR-001)
 - Summary + drill-down stage gates (ADR-002)
-- Per-stage model assignments: Gemini 2.5 Pro / Gemini 2.5 Pro / Claude Opus 4.6 / Codex Mini / Claude Sonnet 4.6 (ADR-008)
-- 15 skill files in `.opencode/skills/`
-- Task dispatch per task unit in Stage 3
+- Per-stage model assignments: Gemini 2.5 Pro / Gemini 2.5 Pro / Claude Opus 4.6 / `o4-mini` / Gemini 2.5 Pro (5a) + Claude Sonnet 4.6 (5b) (ADR-008)
+- Autonomous review→fix loop before every gate: Claude Opus 4.6 (reviewer) + Gemini 2.5 Pro (fixer) (ADR-009)
+- Documentation node as Stage 5a, reusing fixer model (ADR-010)
+- 19 skill files in `.opencode/skills/`
+- Task dispatch per task unit in Stage 3 via LangGraph `Send()` with topological sort
 
 **Discarded alternatives**:
 - OpenCode IDE runtime — eliminated; no IDE lock-in
@@ -178,3 +191,4 @@ All open questions resolved. See Architecture Decision Records in `docs/design/d
 - MCP servers as primary tools — replaced by Python-native capabilities
 - Fixed tech stack — ruled out
 - Fully autonomous execution — ruled out; five human gates required
+- `openai/codex-mini` — not a confirmed OpenAI model; replaced by `openai/o4-mini`
