@@ -1,5 +1,4 @@
 import pytest
-import pathlib
 from monkey_devs.config import load_config, validate_config, ConfigValidationError
 
 
@@ -59,6 +58,14 @@ def test_load_config_has_all_seven_models(tmp_path):
     for key in ["concept-spec", "architecture", "implementation",
                 "code-fixing", "delivery", "reviewer", "fixer"]:
         assert key in cfg.models, f"Missing model key: {key}"
+
+
+def test_load_config_parses_providers_and_timeouts(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(CONFIG_YAML)
+    cfg = load_config(p)
+    assert cfg.providers["anthropic"]["api_key_env"] == "ANTHROPIC_API_KEY"
+    assert cfg.timeouts["implementation"] == 180
 
 
 def test_validate_config_blocks_anthropic_key_literal(tmp_path):

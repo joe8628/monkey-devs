@@ -16,13 +16,13 @@ class WorkflowConfig(BaseModel):
 
 class AppConfig(BaseModel):
     models: dict[str, str]
-    providers: dict[str, dict] = {}
+    providers: dict[str, dict[str, str]] = {}
     timeouts: dict[str, int] = {}
     workflow: WorkflowConfig = WorkflowConfig()
     review: dict[str, bool] = {"enabled": True}
 
 
-_KEY_PATTERNS: list[re.Pattern] = [
+_KEY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"sk-[a-zA-Z0-9\-_]{20,}"),           # OpenAI
     re.compile(r"AIza[0-9A-Za-z\-_]{35}"),            # Google
     re.compile(r"sk-ant-[a-zA-Z0-9\-_]{90,}"),        # Anthropic
