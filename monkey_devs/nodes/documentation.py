@@ -1,0 +1,3 @@
+"""Node: documentation agent."""
+
+pass
