@@ -1,0 +1,35 @@
+models:
+  concept-spec:    google/gemini-2.5-pro
+  architecture:    google/gemini-2.5-pro
+  implementation:  anthropic/claude-opus-4-6
+  code-fixing:     openai/o4-mini
+  delivery:        anthropic/claude-sonnet-4-6
+  reviewer:        anthropic/claude-opus-4-6
+  fixer:           google/gemini-2.5-pro
+
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
+  openai:
+    api_key_env: OPENAI_API_KEY
+  google:
+    api_key_env: GEMINI_API_KEY
+
+timeouts:
+  concept-spec:    120
+  architecture:    120
+  implementation:  180
+  code-fixing:     120
+  delivery:        60
+  reviewer:        90
+  fixer:           120
+
+workflow:
+  max_corrections_per_stage: 3
+  max_handoff_chars: 400000
+  max_intake_turns: 20
+  max_tool_iterations: 30
+  auto_correction_on_validation_failure: true
+
+review:
+  enabled: true

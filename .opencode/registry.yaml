@@ -1,0 +1,105 @@
+workflow:
+  state_db: .opencode/workflow-state.db
+
+skills:
+  - name: conversational-intake
+    description: "Forge-style one-question-at-a-time intake pattern"
+    stages: [1]
+    path: .opencode/skills/conversational-intake.md
+  - name: requirements-writing
+    description: "Writing specs with EARS notation acceptance criteria"
+    stages: [1]
+    path: .opencode/skills/requirements-writing.md
+  - name: stack-evaluation
+    description: "Evaluating and ranking 2-3 technology stack candidates"
+    stages: [1]
+    path: .opencode/skills/stack-evaluation.md
+  - name: system-design
+    description: "Producing architecture decisions and system design artifacts"
+    stages: [2]
+    path: .opencode/skills/system-design.md
+  - name: task-decomposition
+    description: "Breaking work into implementable units for tasks.yaml"
+    stages: [2]
+    path: .opencode/skills/task-decomposition.md
+  - name: adr-writing
+    description: "Writing architecture decision records"
+    stages: [2]
+    path: .opencode/skills/adr-writing.md
+  - name: stack-decision
+    description: "Making a final binding stack decision with rationale"
+    stages: [2]
+    path: .opencode/skills/stack-decision.md
+  - name: tdd-implementation
+    description: "Test-first development pattern"
+    stages: [3]
+    path: .opencode/skills/tdd-implementation.md
+  - name: code-generation
+    description: "Writing production code from task specs"
+    stages: [3]
+    path: .opencode/skills/code-generation.md
+  - name: test-categorization
+    description: "Classifying failures as code-issue or test-issue with rationale"
+    stages: [4]
+    path: .opencode/skills/test-categorization.md
+  - name: systematic-debugging
+    description: "Root-cause analysis before attempting fixes"
+    stages: [4]
+    path: .opencode/skills/systematic-debugging.md
+  - name: delivery-summary
+    description: "Producing the delivery report"
+    stages: [5]
+    path: .opencode/skills/delivery-summary.md
+  - name: readme-writing
+    description: "Writing project README and setup documentation"
+    stages: [5]
+    path: .opencode/skills/readme-writing.md
+  - name: resource-allocation
+    description: "How to read the registry and select skills/tools per stage"
+    stages: [0]
+    path: .opencode/skills/resource-allocation.md
+  - name: stage-gate
+    description: "How to format and present stage gates"
+    stages: [0]
+    path: .opencode/skills/stage-gate.md
+  - name: handoff-composer
+    description: "How to compose structured handoff messages for stage nodes"
+    stages: [0]
+    path: .opencode/skills/handoff-composer.md
+  - name: task-dispatch
+    description: "How to read tasks.yaml and dispatch Implementation nodes"
+    stages: [0]
+    path: .opencode/skills/task-dispatch.md
+  - name: adversarial-review
+    description: "Adversarial critique of stage artifacts: find issues, produce ranked fix brief"
+    stages: [0]
+    path: .opencode/skills/adversarial-review.md
+  - name: api-documentation
+    description: "Generate endpoint/schema API reference from source code"
+    stages: [5]
+    path: .opencode/skills/api-documentation.md
+  - name: developer-guide-writing
+    description: "Write setup, test, and module structure developer documentation"
+    stages: [5]
+    path: .opencode/skills/developer-guide-writing.md
+  - name: docstring-writing
+    description: "Write inline docstrings and comments for public interfaces"
+    stages: [5]
+    path: .opencode/skills/docstring-writing.md
+
+tools:
+  - name: filesystem
+    description: "Read/write access to local filesystem"
+    type: builtin
+    stages: [1, 2, 3, 4, 5]
+    connection: builtin
+  - name: bash
+    description: "Shell command execution (allowlisted commands only)"
+    type: builtin
+    stages: [3, 4]
+    connection: builtin
+  - name: web-search
+    description: "Web search for research during intake and architecture"
+    type: mcp
+    stages: [1, 2]
+    connection: optional
