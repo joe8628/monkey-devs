@@ -1,4 +1,3 @@
-import pathlib
 import pytest
 from monkey_devs.orchestrator import (
     load_registry,
@@ -103,3 +102,18 @@ def test_load_skill_by_name_returns_content(registry, skill_files):
 def test_load_skill_by_name_raises_for_unknown(registry, tmp_path):
     with pytest.raises(KeyError):
         load_skill_by_name(registry, "nonexistent-skill", tmp_path)
+
+
+def test_get_skills_for_stage_excludes_mixed_stage_0_skill():
+    """A skill with stages: [0, 1] must not be returned for stage 1."""
+    mixed_registry = {
+        "skills": [
+            {"name": "normal-skill", "stages": [1], "path": "normal.md"},
+            {"name": "mixed-skill", "stages": [0, 1], "path": "mixed.md"},
+        ],
+        "tools": [],
+    }
+    skills = get_skills_for_stage(mixed_registry, 1)
+    names = [s["name"] for s in skills]
+    assert "normal-skill" in names
+    assert "mixed-skill" not in names

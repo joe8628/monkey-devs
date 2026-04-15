@@ -12,12 +12,12 @@ def load_registry(path: pathlib.Path) -> dict:
 def get_skills_for_stage(registry: dict, stage: int) -> list[dict]:
     """Return skills whose stages list includes the given stage number.
 
-    Stage 0 is reserved for orchestrator-only reference skills and is never
-    returned by this function for normal stage handoffs.
+    Stage 0 is reserved for orchestrator-only reference skills. Any skill whose
+    stages list includes 0 is excluded, regardless of what stage is requested.
     """
     return [
         s for s in registry.get("skills", [])
-        if stage in s.get("stages", []) and stage != 0
+        if stage in s.get("stages", []) and 0 not in s.get("stages", [])
     ]
 
 
