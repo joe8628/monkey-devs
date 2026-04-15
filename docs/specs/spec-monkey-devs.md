@@ -1,9 +1,14 @@
 # Technical Specification: Monkey Devs
 
-**Version**: 1.0-draft
+**Version**: 1.1
 **Date**: 2026-04-14
-**Status**: Draft — pending review
-**Sources**: `docs/concepts/monkey-devs.md` (forge concept document, READY)
+**Status**: Finalized — architecture complete
+**Sources**: `docs/concepts/monkey-devs.md` v1.1 (concept document)
+**Design**: `docs/design/design-monkey-devs.md` v1.0 (all open decisions resolved)
+
+**Changelog**:
+- v1.0 (2026-04-14): Initial draft, ready for architecture
+- v1.1 (2026-04-14): Updated to reflect architectural decisions — IDE dependency removed, Python CLI model adopted, OpenCode references replaced with Python CLI + LangGraph model, FR-37–FR-39 added for multi-vendor model configuration, all open decisions (OD-01–OD-05) resolved, all constraints and assumptions updated
 
 ---
 
@@ -13,7 +18,7 @@ A solo operator who needs to build software — internal tools, scripts, automat
 
 Agentic coding offers a path to independence, but existing tools are either monolithic (one agent does everything poorly) or require the user to manually orchestrate multiple AI tools, which recreates the coordination burden in a different form.
 
-Monkey Devs solves this by providing a structured multi-agent development workflow where specialized AI agents handle each phase of the software development lifecycle under the user's direction. The user retains control at defined decision points without doing the manual coding work themselves.
+Monkey Devs solves this by providing a structured multi-agent development workflow where specialized AI agents handle each phase of the software development lifecycle under the user's direction. The user retains control at defined decision points without doing the manual coding work themselves. The system operates as a standalone Python CLI — no IDE, no cloud infrastructure, no server required.
 
 ---
 
@@ -22,8 +27,8 @@ Monkey Devs solves this by providing a structured multi-agent development workfl
 - **G-01**: Enable a solo operator to initiate, guide, and receive working software without writing code manually.
 - **G-02**: Provide a five-stage structured workflow with a human approval gate at each stage boundary.
 - **G-03**: Support both internal tools/scripts and full applications (web apps, APIs, mobile) within the same workflow.
-- **G-04**: Allow the system to resume a workflow after an IDE session crash or restart without losing progress.
-- **G-05**: Remain IDE-agnostic — the system must not be locked to a single IDE environment.
+- **G-04**: Allow the system to resume a workflow after a session crash or restart without losing progress.
+- **G-05**: Remain IDE-agnostic — the system operates as a standalone CLI with no IDE dependency.
 - **G-06**: Minimize LLM token cost by preferring markdown skill files over agentic tools wherever quality is equivalent.
 - **G-07**: Produce working, locally runnable code as the primary deliverable.
 
@@ -36,6 +41,7 @@ Monkey Devs solves this by providing a structured multi-agent development workfl
 - **Not in scope**: A fixed or opinionated technology stack — agents select the appropriate stack per project.
 - **Not in scope**: Real-time agent monitoring or observability dashboards.
 - **Not in scope**: Automated publishing, packaging, or distribution of produced software.
+- **Not in scope**: IDE plugin or extension development.
 
 ---
 
@@ -43,7 +49,7 @@ Monkey Devs solves this by providing a structured multi-agent development workfl
 
 | Role | Description | Primary Interaction |
 |------|-------------|---------------------|
-| Solo Operator | The single user of the system. Initiates workflows, approves or redirects at each stage gate, and receives the final code output. | Conversational intake, stage gate approval, fix/redirect instructions |
+| Solo Operator | The single user of the system. Initiates workflows, approves or redirects at each stage gate, and receives the final code output. | CLI commands, stage gate approval, fix/redirect instructions |
 
 No additional roles, permissions model, or multi-user support is in scope.
 
@@ -51,70 +57,86 @@ No additional roles, permissions model, or multi-user support is in scope.
 
 ## 5. Functional Requirements
 
-### 5.1 Orchestrator — Principal Agent
+### 5.1 Orchestrator — Python CLI Control Loop
 
-- **FR-01**: The system MUST provide a principal orchestrator agent defined as an OpenCode `mode: primary` agent, switchable via the OpenCode Tab cycle alongside the built-in Build and Plan agents.
-- **FR-02**: The orchestrator MUST act as a resource manager: at each stage, it MUST read the project context and the resource registry to select and allocate the appropriate sub-agent, skills, and tools for that stage.
-- **FR-03**: The orchestrator MUST NOT read, write, or generate code at any point. All code-level operations MUST be delegated to sub-agents.
-- **FR-04**: The orchestrator MUST maintain the LangGraph workflow state, tracking the current stage, completion status, and human approval decisions.
-- **FR-05**: The orchestrator MUST pause workflow execution at each stage boundary and present a stage gate to the user before activating the next sub-agent.
-- **FR-06**: The orchestrator MUST support workflow resumption: if the IDE session ends or crashes, the orchestrator MUST resume from the last completed and approved stage upon restart.
-- **FR-07**: The orchestrator MUST communicate its resource allocation decisions (which sub-agent, skills, and tools were selected) to the user at each stage gate.
+- **FR-01**: The system MUST provide a principal orchestrator implemented as a Python CLI (`monkey-devs`) using Typer, driving a LangGraph workflow graph.
+- **FR-02**: The orchestrator MUST act as a deterministic resource manager: at each stage, it MUST read `.opencode/registry.yaml` and select skills (by filtering `stages` field) and tools for that stage. No LLM is invoked for orchestration.
+- **FR-03**: The orchestrator MUST NOT invoke any LLM and MUST NOT read, write, or generate code at any point. All LLM calls and code-level operations MUST be delegated to stage nodes.
+- **FR-04**: The orchestrator MUST maintain the LangGraph workflow state via the SQLite checkpointer, tracking the current stage, completion status, and human approval decisions.
+- **FR-05**: The orchestrator MUST pause workflow execution at each stage boundary via LangGraph `interrupt()` and present a stage gate to the user before activating the next stage node.
+- **FR-06**: The orchestrator MUST support workflow resumption: if the process terminates or crashes, `monkey-devs resume` MUST restore execution from the last SQLite checkpoint.
+- **FR-07**: The orchestrator MUST communicate its resource allocation decisions to the user at each stage gate. Summary view is default; `monkey-devs details` expands the full allocation log.
 
-### 5.2 Sub-Agents — Stage Executors
+### 5.2 Stage Nodes — LangGraph Async Functions
 
-- **FR-08**: The system MUST provide five pre-defined sub-agents as OpenCode `mode: subagent` agents, each defined as a `.md` file in `.opencode/agents/`:
-  - `concept-spec.md` — Concept & Spec agent
-  - `architecture.md` — Architecture & Task Management agent
-  - `implementation.md` — Implementation & Code Generation agent
-  - `code-fixing.md` — Code Fixing & Test Categorization agent
-  - `delivery.md` — Delivery agent
-- **FR-09**: Sub-agents MUST be invoked automatically by the orchestrator at the appropriate stage; they MAY also be invoked manually via OpenCode `@mention`.
-- **FR-10**: Sub-agents MUST receive a structured handoff message from the orchestrator at session start containing: the allocated skills (as injected prompt context), the granted tools, and the relevant project context for that stage. This message does not need to be natural language.
-- **FR-11**: Sub-agents MUST NOT self-configure — they MUST rely entirely on the orchestrator's handoff message for their skill and tool allocation.
-- **FR-12**: Each sub-agent MUST have tool permissions scoped to its stage via the OpenCode `permission` field.
+- **FR-08**: The system MUST provide five pre-defined stage nodes as async Python functions in the LangGraph graph:
+  - `concept_spec_node` — Concept & Spec (model: `google/gemini-2.5-pro`)
+  - `architecture_node` — Architecture & Task Management (model: `google/gemini-2.5-pro`)
+  - `implementation_node` — Implementation & Code Generation (model: `anthropic/claude-opus-4-6`)
+  - `code_fixing_node` — Code Fixing & Test Categorization (model: `openai/codex-mini`)
+  - `delivery_node` — Delivery (model: `anthropic/claude-sonnet-4-6`)
+- **FR-09**: Stage nodes MUST be invoked automatically by the orchestrator at the appropriate stage via LangGraph graph edges.
+- **FR-10**: Stage nodes MUST receive a structured handoff message as their system prompt. The handoff message MUST follow the four-block schema: `CONTEXT` (project name, stage, task_id, prior_output) / `SKILLS` (full injected skill file content, named and delimited) / `TOOLS` (tool name + scoped instruction) / `INSTRUCTIONS` (stage directive and rejection reason if correction branch).
+- **FR-11**: Stage nodes MUST NOT self-configure — they MUST rely entirely on the handoff message composed by the Python CLI for their skill and tool context.
+- **FR-12**: Each stage node MUST have tool access scoped to its stage via `get_stage_tools(stage)` and a Python bash allowlist validator. Sub-agents MUST NOT access tools not explicitly allocated.
 
 ### 5.3 Workflow Stages
 
-- **FR-13**: Stage 1 — Concept & Spec: The Concept & Spec agent MUST conduct a conversational intake with the user, modeled on the forge skill pattern (focused questions, one at a time, building a concept document iteratively). It MUST produce two artifacts: a concept summary and a requirements spec with acceptance criteria.
-- **FR-14**: Stage 1 — Concept & Spec: The agent MUST propose 2–3 candidate technology stacks with rationale, ranked by suitability. It MUST NOT make a final stack decision.
-- **FR-15**: Stage 2 — Architecture & Task Management: The Architecture agent MUST make a final, binding technology stack decision based on the concept document and stack candidates from Stage 1.
-- **FR-16**: Stage 2 — Architecture & Task Management: The Architecture agent MUST produce a system design and a breakdown of implementation tasks. Tasks MUST be tracked as a structured artifact (e.g. a task list file in the project repository).
-- **FR-17**: Stage 3 — Implementation & Code Generation: The Implementation agent MUST write both production code and tests. Tests MUST be written as part of this stage, not deferred.
-- **FR-18**: Stage 4 — Code Fixing & Test Categorization: The Code Fixing agent MUST run all tests and attempt to fix failing tests automatically. Any failures it cannot resolve MUST be explicitly classified as either `code-issue` or `test-issue` before the stage gate. It MUST NOT silently drop, skip, or weaken tests.
-- **FR-19**: Stage 4 — Code Fixing & Test Categorization: The classification of unresolved failures MUST be presented to the user at the stage gate with a rationale for each classification.
-- **FR-20**: Stage 5 — Delivery: The Delivery agent MUST produce a working, locally runnable code repository. It MUST surface a delivery summary to the user listing what was built and where relevant files are located.
+- **FR-13**: Stage 1 — Concept & Spec: The node MUST conduct a conversational intake with the user using the `conversational-intake` skill (one focused question at a time). It MUST produce two artifacts: `docs/concept.md` and `docs/spec.md` with acceptance criteria.
+- **FR-14**: Stage 1 — Concept & Spec: The node MUST propose 2–3 candidate technology stacks with rationale using the `stack-evaluation` skill, ranked by suitability. It MUST NOT make a final stack decision.
+- **FR-15**: Stage 2 — Architecture: The node MUST make a final, binding technology stack decision using the `stack-decision` skill, based on Stage 1 artifacts.
+- **FR-16**: Stage 2 — Architecture: The node MUST produce `docs/architecture.md` and `.opencode/tasks.yaml`. Tasks in `tasks.yaml` MUST follow the schema: `id`, `title`, `description`, `status` (pending/in-progress/done), `stage`, `depends_on`, `failure_classification`.
+- **FR-17**: Stage 3 — Implementation: The node MUST write both production code and tests using the `tdd-implementation` and `code-generation` skills. Tests MUST be written as part of this stage, not deferred. The node is invoked once per task unit by the orchestrator's task-dispatch logic.
+- **FR-18**: Stage 4 — Code Fixing: The node MUST run all tests and attempt to fix failing tests automatically. Any failures it cannot resolve MUST be explicitly classified as either `code-issue` or `test-issue` in `tasks.yaml` before the stage gate. It MUST NOT silently drop, skip, or weaken tests.
+- **FR-19**: Stage 4 — Code Fixing: The classification of unresolved failures MUST be presented to the user at the stage gate with a rationale for each classification.
+- **FR-20**: Stage 5 — Delivery: The node MUST produce `README.md` and `docs/delivery.md`. It MUST surface a delivery summary listing what was built and where relevant files are located.
 
 ### 5.4 Human Approval Gates
 
-- **FR-21**: The system MUST present a stage gate to the user after each stage completes. The gate MUST give the user three options: approve and continue, fix/update the output and continue, or reject and redirect (returns to the current stage with new instructions).
+- **FR-21**: The system MUST present a stage gate to the user after each stage completes. The gate MUST give the user three options: approve and continue, fix/update the output and continue, or reject and redirect (returns to the current stage with new instructions via a correction branch).
 - **FR-22**: No stage MAY be skipped. All five stage gates require explicit user action before the next stage begins.
 - **FR-23**: When the user fixes or updates a stage output, the workflow MUST continue from that stage with the updated output — it MUST NOT restart from Stage 1.
 
 ### 5.5 Resource Registry
 
-- **FR-24**: The system MUST maintain a resource registry as a manifest/index file (e.g. `.opencode/registry.md` or `.opencode/registry.json`) that lists all available skills and tools with their metadata.
-- **FR-25**: The resource registry MUST be readable and updatable independently of the workflow — new skills and tools MAY be added at any time without modifying sub-agent `.md` files.
-- **FR-26**: The orchestrator MUST read the resource registry at session start to build its allocation model for the current workflow.
+- **FR-24**: The system MUST maintain a resource registry at `.opencode/registry.yaml` listing all available skills and tools with their metadata.
+- **FR-25**: The resource registry MUST be readable and updatable independently of the workflow — new skills and tools MAY be added at any time without modifying Python source code.
+- **FR-26**: The orchestrator MUST read the resource registry at workflow start to build its allocation model for the current workflow.
 
 ### 5.6 Skills System
 
-- **FR-27**: Skills MUST be defined as markdown prompt files stored in a known location (e.g. `.opencode/skills/`).
-- **FR-28**: Skills MUST have metadata accessible to the orchestrator: name, description, and the stage(s) they apply to.
-- **FR-29**: Skills MUST be injected into sub-agents via the orchestrator's structured handoff message — they MUST NOT be hardcoded into sub-agent `.md` files.
-- **FR-30**: The system SHOULD prefer skills over tools in all cases where a skill can cover the need at equivalent quality. Tools MUST only be allocated when a skill cannot fulfill the requirement.
+- **FR-27**: Skills MUST be defined as markdown prompt files stored in `.opencode/skills/`.
+- **FR-28**: Skills MUST have metadata in `registry.yaml`: `name`, `description`, `stages` (list of applicable stage numbers), and `path`.
+- **FR-29**: Skills MUST be injected into stage nodes via the orchestrator's handoff message SKILLS block — full file content concatenated as named, delimited sections. Skills MUST NOT be hardcoded into stage node Python functions.
+- **FR-30**: The system MUST prefer skills over tools in all cases where a skill can cover the need. Binary allocation rule: skill if the operation produces/transforms/structures text or decisions; tool only if the operation requires executing code, reading/writing files, or external system interaction.
 
 ### 5.7 Tools
 
-- **FR-31**: Tools are agentic tools (MCP servers and other agentic tool formats) registered in the resource registry.
-- **FR-32**: Tools MUST have metadata accessible to the orchestrator: name, description, type, and the stage(s) they apply to.
-- **FR-33**: Tool access MUST be granted to sub-agents via the OpenCode `permission` field and the orchestrator's handoff message. Sub-agents MUST NOT access tools not explicitly allocated to them.
+- **FR-31**: Tools are Python-callable capabilities (file I/O, bash execution, optional MCP servers) registered in `registry.yaml`.
+- **FR-32**: Tools MUST have metadata in `registry.yaml`: `name`, `description`, `type` (builtin/mcp), `stages`, and `connection`.
+- **FR-33**: Tool access MUST be granted to stage nodes via `get_stage_tools(stage)`. A Python bash allowlist validator MUST block any shell command not on the permitted list before execution. Stage nodes MUST NOT access tools not explicitly allocated.
 
 ### 5.8 Technology Stack Selection
 
-- **FR-34**: The Concept & Spec agent MUST propose a ranked shortlist of 2–3 technology stack candidates with rationale at the end of Stage 1. This informs but does not bind the Architecture stage.
-- **FR-35**: The Architecture agent MUST make the final, binding stack decision at Stage 2. This decision MUST be recorded in the project's architecture artifact and communicated to the user at the Stage 2 gate.
+- **FR-34**: The Concept & Spec node MUST propose a ranked shortlist of 2–3 technology stack candidates with rationale at the end of Stage 1.
+- **FR-35**: The Architecture node MUST make the final, binding stack decision at Stage 2. This decision MUST be recorded in `docs/architecture.md` and communicated to the user at the Stage 2 gate.
 - **FR-36**: No fixed or default stack MAY be imposed by the system. Stack selection is always per-project.
+
+### 5.9 Multi-Vendor Model Configuration
+
+- **FR-37**: Each stage node MUST have an independently configurable LLM model. Models MAY be from different vendors. Configuration is stored in `.opencode/config.yaml` using LiteLLM model string format (`provider/model-id`).
+- **FR-38**: Model configuration MUST be defined before a workflow starts and MAY only be updated before starting or after a workflow completes. `monkey-devs config set-model` MUST be blocked with a clear error message during an active workflow.
+- **FR-39**: The CLI MUST provide commands to view (`monkey-devs config models`), update (`monkey-devs config set-model <stage> <model>`), and validate (`monkey-devs config validate`) model configuration. Validate MUST check for API key presence, model reachability, and accidental key literals in config files.
+
+**Default model assignments:**
+
+| Stage | Default Model | Rationale |
+|-------|--------------|-----------|
+| Concept & Spec | `google/gemini-2.5-pro` | Large context window for long intake conversations; strong reasoning for requirements |
+| Architecture | `google/gemini-2.5-pro` | Handles full project context for system design |
+| Implementation | `anthropic/claude-opus-4-6` | Highest code generation quality for production code + tests |
+| Code Fixing | `openai/codex-mini` | Purpose-built for code understanding and repair |
+| Delivery | `anthropic/claude-sonnet-4-6` | Fast and precise for documentation and delivery summary |
 
 ---
 
@@ -122,32 +144,35 @@ No additional roles, permissions model, or multi-user support is in scope.
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-01 | Resumability | The workflow MUST be resumable after an IDE session crash or restart. LangGraph state MUST be persisted durably between sessions. |
-| NFR-02 | IDE Portability | The system MUST NOT be locked to a single IDE. The OpenCode agent standard and LangGraph state persistence MUST be the only runtime dependencies. |
-| NFR-03 | Cost Efficiency | The system SHOULD prefer markdown skill files over agentic tools in all cases where quality is equivalent. No formal cost-per-run target; preference is qualitative and enforced by orchestrator allocation logic. |
-| NFR-04 | Correctness | All test failures at Stage 4 MUST be classified before delivery. No unresolved test failure MAY be silently passed through to Stage 5. |
-| NFR-05 | Transparency | The orchestrator MUST surface its resource allocation decisions (sub-agent, skills, tools selected) to the user at every stage gate. |
-| NFR-06 | Extensibility | New skills and tools MUST be addable to the resource registry without modifying existing sub-agent definitions or orchestrator logic. |
+| NFR-01 | Resumability | The workflow MUST be resumable after a process crash or session end. LangGraph SQLite checkpointer at `.opencode/workflow-state.db` MUST persist state durably between sessions. |
+| NFR-02 | Portability | The system MUST NOT be locked to any IDE or external service. The `monkey-devs` Python CLI and LangGraph SQLite state are the only runtime dependencies. Runs on macOS, Linux, and Windows. |
+| NFR-03 | Cost Efficiency | The system MUST prefer markdown skill files over tools. Binary rule: skill for text/decision operations; tool only for execution operations. Enforced deterministically by Python CLI via `stages` filter on `registry.yaml`. |
+| NFR-04 | Correctness | All test failures at Stage 4 MUST be classified (`code-issue` or `test-issue`) before Stage 5 begins. The stage gate MUST block advancement if any unclassified failures remain in `tasks.yaml`. |
+| NFR-05 | Transparency | The stage gate MUST display sub-agent name, skills used, and tools used at every gate. Full allocation detail available via `monkey-devs details` (reads JSONL run log). |
+| NFR-06 | Extensibility | New skills and tools MUST be addable by updating `registry.yaml` only — no Python source changes required. |
 
 ---
 
 ## 7. System Context
 
-Monkey Devs is an agentic development workflow system that sits inside an OpenCode-compatible IDE environment. It does not operate as a standalone application — it is invoked by the user switching to the Monkey Devs primary agent in the IDE's agent selector.
+Monkey Devs is a standalone Python CLI application. It does not require an IDE, a running server, or any cloud infrastructure. The user installs it locally and interacts with it entirely through the terminal.
 
 **Inside the system boundary:**
-- The principal orchestrator agent (`monkey-devs.md`)
-- Five stage sub-agents (`concept-spec.md`, `architecture.md`, `implementation.md`, `code-fixing.md`, `delivery.md`)
-- The resource registry (manifest/index file)
-- Skill files (markdown prompt files)
-- LangGraph workflow state (persisted externally, managed by the orchestrator)
+- `monkey-devs` Python CLI package (`monkey_devs/`)
+- LangGraph workflow graph (five stage nodes + five correction branches + interrupt points)
+- Python CLI orchestrator (deterministic control loop — no LLM)
+- Resource registry (`.opencode/registry.yaml`)
+- Model and provider config (`.opencode/config.yaml`)
+- Skill files (`.opencode/skills/*.md`) — 15 files
+- LangGraph SQLite state (`.opencode/workflow-state.db`)
+- Task file (`.opencode/tasks.yaml`)
+- Run logs (`.opencode/logs/run-<timestamp>.jsonl`)
 
 **Outside the system boundary (dependencies):**
-- **OpenCode**: provides the agent runtime, Tab-switching for primary agents, `@mention` invocation for sub-agents, and the `permission` field for tool access control
-- **LangGraph**: provides the workflow state machine and durable state persistence
-- **MCP servers and other agentic tools**: external tools registered in the resource registry and granted to sub-agents at handoff
-- **The user's IDE** (Claude Code, Cursor, or any OpenCode-compatible environment): the surface through which the user interacts with the orchestrator and approves stage gates
-- **The user's local file system**: destination for all project output
+- **LangGraph** + `langgraph-checkpoint-sqlite`: workflow state machine and durable persistence
+- **LiteLLM**: multi-vendor LLM abstraction layer
+- **LLM providers**: Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`), Google (`GEMINI_API_KEY`) — keys stored in environment only
+- **User's local filesystem**: destination for all project output
 
 ---
 
@@ -157,70 +182,118 @@ Monkey Devs is an agentic development workflow system that sits inside an OpenCo
 
 | Term | Definition |
 |------|------------|
-| Orchestrator | The principal agent (`mode: primary`). A pure resource manager — reads project context and registry, allocates skills and tools to sub-agents, manages workflow state. Never reads or writes code. |
-| Sub-agent | A stage-scoped executor agent (`mode: subagent`). Receives skills and tools via handoff message. Performs all code-level and domain-specific work for its assigned stage. |
-| Skill | A markdown prompt file containing instructional content injected into a sub-agent's context at handoff. Cost-effective; preferred over tools wherever sufficient. |
-| Tool | An agentic tool (MCP server or equivalent) granted to a sub-agent at handoff for executable operations a skill cannot perform. |
-| Resource Registry | A manifest/index file listing all available skills and tools with metadata. Read by the orchestrator at session start. Updatable independently of agent definitions. |
-| Stage | One of five named phases in the workflow. Each stage is executed by its designated sub-agent and ends with a human approval gate. |
-| Stage Gate | A pause point at the end of each stage where the user approves, fixes/updates, or rejects the stage output before the next stage begins. |
-| Handoff Message | A structured (not necessarily natural language) message sent by the orchestrator to initiate a sub-agent session. Contains allocated skills as prompt context, granted tool references, and project context relevant to that stage. |
-| Workflow | The five-stage pipeline instance for a specific project. Persisted by LangGraph. Resumable after session interruption. |
-| Task | A unit of implementation work produced by the Architecture agent in Stage 2. Tracked as a structured artifact in the project repository. |
+| Orchestrator | The Python CLI control loop. Deterministic — no LLM. Reads registry, filters skills/tools by stage, composes handoff messages, dispatches tasks, renders stage gates, drives LangGraph. |
+| Stage Node | An async Python function in the LangGraph graph. Receives handoff message as system prompt. Invokes LiteLLM. Streams output to terminal. Writes artifacts to filesystem. |
+| Skill | A markdown prompt file in `.opencode/skills/`. Injected into stage node system prompts at handoff. Zero execution cost. |
+| Tool | A Python-callable capability (file I/O, bash) granted to a stage node via `get_stage_tools()`. Bash access is gated by an allowlist validator. |
+| Resource Registry | `.opencode/registry.yaml` — YAML manifest of all skills and tools with metadata. Read by Python CLI at workflow start. |
+| Stage Gate | A CLI pause point after each stage. LangGraph `interrupt()` halts execution. CLI renders summary + options. Resumes on `monkey-devs approve` or `monkey-devs reject`. |
+| Handoff Message | A four-block markdown message (CONTEXT / SKILLS / TOOLS / INSTRUCTIONS) composed by the Python CLI and used as the LLM system prompt for a stage node invocation. |
+| Workflow | The five-stage LangGraph pipeline instance for a specific project. Persisted in SQLite. Resumable after interruption. |
+| Correction Branch | A paired LangGraph node for each stage. Activated on rejection — carries rejection reason and prior output, re-invokes the same stage node with updated context. |
+| Task | A unit of implementation work in `.opencode/tasks.yaml`. Created by Stage 2. Dispatched by Python CLI to individual Implementation nodes in Stage 3. |
 
 ### 8.2 Core Entities
 
-**Project**
-- Purpose: Represents a unit of work initiated by the user.
-- Key attributes: name, description, current stack (set at Stage 2), status (active / delivered)
-- Relationships: has one Workflow; produces one repository as output
+**WorkflowState (LangGraph TypedDict)**
 
-**Workflow**
-- Purpose: The five-stage pipeline instance for a Project.
-- Key attributes: current stage, stage statuses (pending / active / approved / rejected), LangGraph state reference
-- Relationships: belongs to one Project; contains five Stages
+```python
+class WorkflowState(TypedDict):
+    project_name: str
+    project_path: str
+    current_stage: int                       # 1–5
+    workflow_status: str                     # active | completed | interrupted
+    stage_statuses: dict[int, str]           # pending | active | complete | approved | rejected
+    stage_outputs: dict[int, str]            # path to artifact per stage
+    stage_models: dict[int, str]             # model used per stage (audit trail)
+    correction_active: bool
+    correction_stage: int | None
+    correction_reason: str | None
+    tasks: list[str]                         # task IDs from tasks.yaml
+    tasks_dispatched: list[str]
+    tasks_completed: list[str]
+    gate_decisions: dict[int, str]           # approved | fix | rejected
+    allocated_skills: dict[int, list[str]]
+    allocated_tools: dict[int, list[str]]
+```
 
-**Stage**
-- Purpose: One step in the Workflow, executed by a designated sub-agent.
-- Key attributes: name, status (pending / active / approved / rejected), output artifact reference
-- Relationships: belongs to one Workflow; executed by one sub-agent; may be retried on rejection
+**Task (tasks.yaml entry)**
 
-**Skill**
-- Purpose: An instructional markdown prompt file injected into a sub-agent's context at handoff.
-- Key attributes: name, description, applicable stages, file path
-- Relationships: registered in the Resource Registry; allocated by the Orchestrator; injected into Sub-agents
+```yaml
+- id: T-01
+  title: "Implement user authentication"
+  description: "..."
+  status: pending             # pending | in-progress | done
+  stage: 3
+  depends_on: []
+  failure_classification: null  # code-issue | test-issue (Stage 4 only)
+```
 
-**Tool**
-- Purpose: An agentic tool (MCP server or other agentic tool format) granted to a sub-agent for executable operations.
-- Key attributes: name, description, type (MCP / other), applicable stages, connection reference
-- Relationships: registered in the Resource Registry; allocated by the Orchestrator; granted to Sub-agents via OpenCode `permission`
+**Skill (registry.yaml entry)**
 
-**Task**
-- Purpose: A unit of implementation work produced by the Architecture agent.
-- Key attributes: title, description, status (pending / in-progress / done), assigned stage
-- Relationships: belongs to a Project; created in Stage 2; consumed in Stage 3 and Stage 4
+```yaml
+- name: conversational-intake
+  description: "Forge-style one-question-at-a-time intake pattern"
+  stages: [1]
+  path: .opencode/skills/conversational-intake.md
+```
+
+**Tool (registry.yaml entry)**
+
+```yaml
+- name: bash
+  description: "Shell command execution (allowlisted commands only)"
+  type: builtin
+  stages: [3, 4]
+  connection: builtin
+```
 
 ---
 
 ## 9. Interface Contracts
 
-### Exposed Interfaces
+### CLI Interface
 
-| Interface | Type | Description |
-|-----------|------|-------------|
-| Orchestrator Agent | OpenCode `mode: primary` | The user-facing entry point. Switched to via Tab in the IDE. Accepts natural language instructions and stage gate decisions from the user. |
-| Stage Gate | Structured prompt | Presented by the orchestrator at the end of each stage. Displays: stage output summary, allocated resources used, unresolved issues (if any), and three action options: approve / fix+continue / reject+redirect. |
-| Resource Registry | Manifest/index file | Read by the orchestrator at session start. Lists all available skills and tools. Writable by the user to add or update resources. |
+| Command | Description |
+|---------|-------------|
+| `monkey-devs init` | Initialize new project, create `.opencode/` structure, add `.gitignore` entries, start Stage 1 |
+| `monkey-devs run` | Run the current stage (streams LLM output to terminal) |
+| `monkey-devs run --verbose` | Run with skill injection + state transition events shown |
+| `monkey-devs run --debug` | Run with full real-time event log |
+| `monkey-devs status` | Show workflow state, current stage, task list |
+| `monkey-devs approve` | Approve current stage gate, advance to next stage |
+| `monkey-devs reject --reason "..."` | Reject current stage, route to correction branch |
+| `monkey-devs resume` | Resume an interrupted workflow from last SQLite checkpoint |
+| `monkey-devs details` | Show full allocation log for current stage (reads JSONL run log) |
+| `monkey-devs tasks` | List tasks and status (Stage 3+) |
+| `monkey-devs registry` | Show resource registry contents |
+| `monkey-devs skills list` | List skills with stage assignments |
+| `monkey-devs config models` | Show current model assignments |
+| `monkey-devs config set-model <stage> <model>` | Update model for a stage (blocked during active workflow) |
+| `monkey-devs config validate` | Check API keys, model reachability, no key literals in config |
 
-### Consumed Interfaces
+### Handoff Message Schema
 
-| Interface | Provider | Purpose |
-|-----------|----------|---------|
-| OpenCode Agent Runtime | OpenCode | Hosts and executes all agents; provides Tab-switching, `@mention` invocation, and `permission`-based tool access control |
-| LangGraph State Machine | LangGraph | Manages workflow state transitions, human-in-the-loop pause/resume, and durable state persistence across IDE sessions |
-| Skill Files | Local filesystem (`.opencode/skills/`) | Markdown prompt files read by the orchestrator and injected into sub-agent handoff messages |
-| Agentic Tools | MCP servers + other agentic tool formats | Executable capabilities granted to sub-agents for operations skills cannot perform |
-| Sub-agent Handoff | Structured message | Orchestrator-to-sub-agent protocol. Structured (not required to be natural language). Contains: injected skill prompts, granted tool references, stage-specific project context. Initiates the sub-agent session. |
+```
+## HANDOFF: [Stage Name]
+
+### CONTEXT
+project: [project name]
+stage: [1-5]
+task_id: [T-XX | "all"]
+prior_output: [artifact path | "none"]
+
+### SKILLS
+---
+## Skill: [name]
+[full skill file content]
+
+### TOOLS
+- [tool-name]: [scoped instruction for this stage]
+
+### INSTRUCTIONS
+[Stage directive. Rejection reason wrapped in <user-rejection-reason> tags if correction branch.]
+```
 
 ---
 
@@ -228,32 +301,32 @@ Monkey Devs is an agentic development workflow system that sits inside an OpenCo
 
 **Constraints:**
 
-- **C-01**: All agents (orchestrator and sub-agents) MUST be defined using the OpenCode agent standard (`.md` files in `.opencode/agents/`).
-- **C-02**: The orchestrator MUST NOT read, write, or generate code under any circumstances.
+- **C-01**: All stage logic MUST be implemented as LangGraph async node functions in the Python `monkey_devs` package.
+- **C-02**: The orchestrator (Python CLI control loop) MUST NOT invoke any LLM under any circumstances.
 - **C-03**: Skills MUST be markdown files. They MUST NOT be compiled code, scripts, or executables.
-- **C-04**: LangGraph is the required workflow state manager. No alternative state persistence mechanism is in scope.
+- **C-04**: LangGraph with `langgraph-checkpoint-sqlite` is the required workflow state manager. No alternative state persistence is in scope.
 - **C-05**: Deployment automation is out of scope. The system delivers a working local repository only.
 - **C-06**: The system targets a single user. No multi-user, authentication, or authorization layer is in scope.
 - **C-07**: All five stage gates are mandatory. No stage may be skipped regardless of project size or complexity.
+- **C-08**: API keys MUST be stored in environment variables only. `config.yaml` MUST store env var names, never key values. `monkey-devs config validate` MUST block workflow start if key literals are detected.
 
-**Assumptions:**
+**Assumptions — all resolved:**
 
-- **A-01**: The user's IDE supports the OpenCode agent standard. [Confirm: verify OpenCode compatibility for each target IDE before implementation begins]
-- **A-02**: LangGraph's built-in persistence layer is sufficient for cross-session state durability. [Confirm: evaluate LangGraph checkpointing capabilities for the target deployment environment]
-- **A-03**: The sub-agent handoff message format (structured, non-natural-language) is sufficient for sub-agents to initialize correctly without additional configuration. [Confirm: validate handoff message schema during prototype phase]
-- **A-04**: The resource registry manifest format will be defined during architecture. [Deferred to architect — see OD-01]
+- **A-01**: ~~OpenCode IDE compatibility~~ — **Eliminated**. System is a standalone Python CLI. No IDE compatibility required or assumed.
+- **A-02**: LangGraph SQLite checkpointer durability across process crashes. **Validated** — SQLite file survives process termination; LangGraph `interrupt()` + resume is a first-class supported pattern.
+- **A-03**: Four-block handoff message schema is sufficient for stage nodes to initialize correctly. **Resolved** — schema defined (CONTEXT / SKILLS / TOOLS / INSTRUCTIONS). To be validated empirically during prototype.
 
 ---
 
-## 11. Open Decisions
+## 11. Open Decisions — ALL RESOLVED
 
-| ID | Question | Options | Owner | Required By |
-|----|----------|---------|-------|-------------|
-| OD-01 | What is the resource registry file format and schema? | Markdown index / JSON manifest / YAML manifest | Architect | Before implementation begins |
-| OD-02 | What does the orchestrator surface at each stage gate — full skill/tool allocation detail, or a summary? | Full allocation log / summary with drill-down / minimal notice | Architect | Before Stage Gate UX is designed |
-| OD-03 | When the user rejects a stage, how does LangGraph handle state? | Rewind to previous node / branch into correction sub-graph / patch and re-validate | Architect | Before LangGraph graph is designed |
-| OD-04 | What are the exact OpenCode `permission` settings for each sub-agent? | Per-agent permission matrix (e.g. Implementation: full bash+edit; Concept: read-only) | Architect | Before sub-agent `.md` files are written |
-| OD-05 | Does the Architecture agent's task breakdown integrate with an external task tracker, or is a local file sufficient? | Local markdown task file / GitHub Issues / Linear / other | Architect + User | Before Stage 2 sub-agent is designed |
+| ID | Question | Decision | Rationale |
+|----|----------|----------|-----------|
+| OD-01 | Resource registry format | YAML at `.opencode/registry.yaml` | Human-readable, comment-friendly, structured for deterministic filtering. See ADR-001. |
+| OD-02 | Stage gate disclosure level | Summary + drill-down via `monkey-devs details` | Routine approvals stay clean; full log available on demand. See ADR-002. |
+| OD-03 | LangGraph rejection handling | Correction branch per stage | First-class LangGraph node; preserves rejection reason and prior output. See ADR-003. |
+| OD-04 | Sub-agent permission model | Python-enforced via `get_stage_tools()` + bash allowlist validator | OpenCode eliminated; permissions are code, not IDE config. |
+| OD-05 | Task tracking location | Local YAML at `.opencode/tasks.yaml` | No external dependencies; readable by Python CLI; structured for task dispatch. |
 
 ---
 
@@ -262,41 +335,19 @@ Monkey Devs is an agentic development workflow system that sits inside an OpenCo
 - Automated deployment to any environment (cloud, VPS, container registry)
 - Multi-user support, team workflows, or shared project state
 - A fixed or default technology stack
-- Real-time agent monitoring, logging dashboards, or observability tooling
+- Real-time agent monitoring, logging dashboards, or observability tooling beyond JSONL run logs
 - Automated publishing, packaging, or distribution of produced software
-- IDE-specific plugin or extension development (system relies on OpenCode standard, not native IDE APIs)
+- IDE-specific plugin or extension development
 - Any form of billing, usage metering, or cost tracking
+- Web UI or graphical interface
 
 ---
 
-## Appendix: Spec Health Report
+## Ready for Implementation
 
-**Ambiguous requirements:**
-- **FR-12** ("Sub-agents MUST rely entirely on the orchestrator's handoff message"): Does not specify behavior if the handoff message is malformed or incomplete — recommend adding an error handling requirement before implementation.
-- **FR-30** ("equivalent quality"): The condition for preferring skills over tools is qualitative. The orchestrator must make this judgment call — consider defining a rubric in the resource registry metadata (e.g. a `preferred` flag on skill entries).
+**Spec file**: `docs/specs/spec-monkey-devs.md` v1.1 — Finalized
+**Concept file**: `docs/concepts/monkey-devs.md` v1.1 — Architecture Complete
+**Design file**: `docs/design/design-monkey-devs.md` v1.0 — Approved for generation
 
-**Unconfirmed assumptions:**
-- **A-01**: OpenCode compatibility of target IDEs (Claude Code, Cursor) has not been formally verified — this is the highest-risk assumption.
-- **A-02**: LangGraph persistence durability across IDE session crashes needs validation in the target environment before architecture is finalized.
-- **A-03**: The handoff message format is unspecified — the architect must define the schema before any sub-agent can be implemented.
-
-**Weak sources:**
-- §6 NFR-03 (cost efficiency): Derived from the philosophical preference stated in the concept doc, not from a formal requirement. Treat as a design principle, not an enforceable NFR, until the user defines a measurable threshold.
-
-**Unresolved conflicts from source material:**
-- None.
-
----
-
-## Ready for Architecture
-
-**Spec file**: `docs/specs/spec-monkey-devs.md`
-**Status**: Draft
-**Solid sections**: Problem Statement, Goals, Non-Goals, Users & Stakeholders, Functional Requirements (all 36), System Context, Data Model, Interface Contracts, Constraints, Out of Scope
-**Needs confirmation before architecture begins**:
-- OD-01: Resource registry file format and schema
-- OD-03: LangGraph stage rejection handling (rewind / branch / patch)
-- OD-04: Per-sub-agent OpenCode `permission` matrix
-- A-01: Validate OpenCode compatibility with target IDEs
-- A-02: Validate LangGraph cross-session persistence durability
-- A-03: Define handoff message schema
+All open decisions resolved. All assumptions confirmed or eliminated. No blockers.
+See `docs/design/design-monkey-devs.md` Part III for implementation units and generation order.
