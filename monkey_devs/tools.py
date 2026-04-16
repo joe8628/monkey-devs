@@ -1,8 +1,11 @@
 """Tool definitions available to monkey-devs agents."""
 
+import asyncio
+import json
 import os
-import shlex
 import pathlib
+import shlex
+import subprocess
 
 class FilesystemBoundaryError(Exception):
     pass
@@ -13,8 +16,6 @@ class BashValidationError(Exception):
 
 
 ALLOWLIST = {"pytest", "npm", "yarn", "cargo", "go", "make", "mvn", "python", "python3", "pip", "pip3"}
-
-METACHARACTERS = [";", "&&", "||", "$(", "`", "| ", ">", "<"]
 
 FILESYSTEM_READ = {
     "type": "function",
@@ -75,10 +76,11 @@ def get_stage_tools(stage: int) -> list[dict]:
 
 
 def validate_path(path: str, project_root: str) -> str:
-    real = os.path.realpath(os.path.join(project_root, path))
-    if not real.startswith(os.path.realpath(project_root)):
+    root = pathlib.Path(os.path.realpath(project_root))
+    resolved = pathlib.Path(os.path.realpath(os.path.join(project_root, path)))
+    if not resolved.is_relative_to(root):
         raise FilesystemBoundaryError(f"Path {path!r} escapes project root")
-    return real
+    return str(resolved)
 
 
 def validate_bash_command(command: str) -> None:
@@ -105,8 +107,6 @@ def validate_bash_command(command: str) -> None:
 
 async def execute_tool(tool_call: dict, stage: int, project_root: str = ".") -> str:
     name = tool_call["function"]["name"]
-    import json
-
     args = json.loads(tool_call["function"]["arguments"])
 
     if name == "filesystem_read":
@@ -125,12 +125,9 @@ async def execute_tool(tool_call: dict, stage: int, project_root: str = ".") -> 
 
     if name == "bash_execute":
         validate_bash_command(args["command"])
-        import asyncio
-        import subprocess
-
         result = await asyncio.to_thread(
             subprocess.run,
-            args["command"],
+            shlex.split(args["command"]),
             shell=False,
             capture_output=True,
             text=True,
