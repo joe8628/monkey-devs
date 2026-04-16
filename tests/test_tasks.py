@@ -1,4 +1,4 @@
-import pathlib, asyncio, pytest
+import asyncio, pytest
 from monkey_devs.tasks import (load_tasks, update_task_status, topological_sort,
                                 validate_tasks_yaml, TaskCycleError)
 VALID_YAML = "project: test\ntasks:\n  - id: T-01\n    title: Auth\n    description: JWT auth\n    status: pending\n    stage: 3\n    depends_on: []\n    failure_classification: null\n"

@@ -15,7 +15,6 @@ def load_tasks(path: pathlib.Path) -> list[dict]:
 
 
 def topological_sort(tasks: list[dict]) -> list[dict]:
-    id_map = {t["id"]: t for t in tasks}
     in_degree = {t["id"]: len(t.get("depends_on", [])) for t in tasks}
     queue = [t for t in tasks if in_degree[t["id"]] == 0]
     result = []
