@@ -1,6 +1,5 @@
 """Tests for compose_handoff in monkey_devs.orchestrator (IU-06)."""
 from monkey_devs.orchestrator import compose_handoff
-from monkey_devs.state import WorkflowState
 
 
 def test_compose_handoff_contains_four_blocks(tmp_path, minimal_state):
