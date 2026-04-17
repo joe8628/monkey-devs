@@ -1,10 +1,9 @@
 """JSONL structured run logger for Monkey Devs workflow events."""
 import datetime
-import itertools
 import json
+import os
 import pathlib
-
-_counter = itertools.count()
+import uuid
 
 
 class RunLogger:
@@ -14,8 +13,8 @@ class RunLogger:
         log_dir = pathlib.Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S")
-        n = next(_counter)
-        self._path = log_dir / f"run-{ts}-{n:04d}.jsonl"
+        suffix = uuid.uuid4().hex[:8]
+        self._path = log_dir / f"run-{ts}-{os.getpid()}-{suffix}.jsonl"
         self._path.touch()
         self._rotate(log_dir, keep=10)
 

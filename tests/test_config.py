@@ -68,6 +68,27 @@ def test_load_config_parses_providers_and_timeouts(tmp_path):
     assert cfg.timeouts["implementation"] == 180
 
 
+def test_load_config_rejects_empty_yaml(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("# comment only\n")
+    with pytest.raises(ValueError, match="config.yaml"):
+        load_config(p)
+
+
+def test_load_config_rejects_invalid_yaml_with_filename(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("models: [unterminated\n")
+    with pytest.raises(ValueError, match="config.yaml"):
+        load_config(p)
+
+
+def test_load_config_rejects_missing_required_model_key(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(CONFIG_YAML.replace("  reviewer: anthropic/claude-opus-4-6\n", ""))
+    with pytest.raises(ValueError, match="reviewer"):
+        load_config(p)
+
+
 def test_validate_config_blocks_anthropic_key_literal(tmp_path):
     key = "sk-ant-" + "a" * 95   # 95 chars after prefix → matches pattern
     p = tmp_path / "config.yaml"

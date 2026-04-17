@@ -1,4 +1,5 @@
 import json
+import os
 from monkey_devs.logger import RunLogger
 
 
@@ -27,3 +28,8 @@ def test_multiple_events_append_to_same_file(tmp_path):
     logger.log("stage_completed", stage=1)
     lines = list(tmp_path.iterdir())[0].read_text().splitlines()
     assert len(lines) == 2
+
+
+def test_log_filename_includes_process_id(tmp_path):
+    logger = RunLogger(log_dir=tmp_path)
+    assert f"-{os.getpid()}-" in logger._path.name

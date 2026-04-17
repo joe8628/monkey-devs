@@ -75,17 +75,35 @@ def compose_handoff(state, stage: int, registry: dict, skills_base, config,
 
     Returns a string with four blocks: CONTEXT, SKILLS, TOOLS, INSTRUCTIONS.
     """
+    max_chars: int = getattr(config, "max_handoff_chars", 400000)
+
     skills = get_skills_for_stage(registry, stage)
     tools = get_tools_for_stage(registry, stage)
-    skills_block = "\n".join(
-        f"---\n## Skill: {s['name']}\n{(pathlib.Path(skills_base) / s['path']).read_text()}"
-        for s in skills if (pathlib.Path(skills_base) / s['path']).exists()
-    )
+
+    skill_parts = []
+    chars_used = 0
+    for s in skills:
+        skill_path = pathlib.Path(skills_base) / s["path"]
+        if not skill_path.exists():
+            warnings.warn(f"Skill file not found: {skill_path}", stacklevel=2)
+            continue
+        part = f"---\n## Skill: {s['name']}\n{skill_path.read_text()}"
+        if chars_used + len(part) > max_chars:
+            break
+        skill_parts.append(part)
+        chars_used += len(part)
+    skills_block = "\n".join(skill_parts)
+
     prior_block = ""
     for s_key, paths in (prior_paths or {}).items():
         for p in paths:
             content = pathlib.Path(p).read_text() if pathlib.Path(p).exists() else ""
-            prior_block += f'\n<prior-stage-output stage="{s_key}">\n{content}\n</prior-stage-output>'
+            chunk = f'\n<prior-stage-output stage="{s_key}">\n{content}\n</prior-stage-output>'
+            if chars_used + len(chunk) > max_chars:
+                break
+            prior_block += chunk
+            chars_used += len(chunk)
+
     tools_block = "\n".join(f"- {t['name']}: {t['description']}" for t in tools)
     return (f"## HANDOFF: Stage {stage}\n\n### CONTEXT\nproject: {state['project_name']}\n"
             f"stage: {sub_stage or stage}\ntask_id: {task_id or 'all'}\n{prior_block}\n\n"

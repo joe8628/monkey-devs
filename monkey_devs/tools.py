@@ -104,10 +104,22 @@ def validate_bash_command(command: str) -> None:
     if exe in ("pip", "pip3") and (len(tokens) < 2 or tokens[1] != "install"):
         raise BashValidationError("pip only permits 'install' subcommand")
 
+    if exe in ("python", "python3"):
+        for token in tokens[1:]:
+            if token in ("-c", "-m"):
+                raise BashValidationError(f"python {token} flag is not permitted")
+
+
+class ToolError(Exception):
+    pass
+
 
 async def execute_tool(tool_call: dict, stage: int, project_root: str = ".") -> str:
     name = tool_call["function"]["name"]
-    args = json.loads(tool_call["function"]["arguments"])
+    try:
+        args = json.loads(tool_call["function"]["arguments"])
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"Invalid JSON arguments for tool {name!r}: {exc}") from exc
 
     if name == "filesystem_read":
         p = validate_path(args["path"], project_root)
@@ -135,4 +147,4 @@ async def execute_tool(tool_call: dict, stage: int, project_root: str = ".") -> 
         )
         return result.stdout + result.stderr
 
-    return f"Unknown tool: {name}"
+    raise ToolError(f"Unknown tool: {name!r}")

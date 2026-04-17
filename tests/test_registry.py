@@ -61,6 +61,36 @@ def test_load_registry_returns_dict(tmp_path):
     assert len(reg["tools"]) == 2
 
 
+def test_load_registry_rejects_empty_yaml(tmp_path):
+    p = tmp_path / "registry.yaml"
+    p.write_text("# comment only\n")
+    with pytest.raises(ValueError, match="registry.yaml"):
+        load_registry(p)
+
+
+def test_load_registry_rejects_invalid_yaml_with_filename(tmp_path):
+    p = tmp_path / "registry.yaml"
+    p.write_text("skills: [unterminated\n")
+    with pytest.raises(ValueError, match="registry.yaml"):
+        load_registry(p)
+
+
+def test_load_registry_rejects_non_list_skill_stages(tmp_path):
+    p = tmp_path / "registry.yaml"
+    p.write_text(
+        """\
+skills:
+  - name: broken-skill
+    description: "Broken"
+    stages: 2
+    path: .opencode/skills/broken.md
+tools: []
+"""
+    )
+    with pytest.raises(ValueError, match="broken-skill"):
+        load_registry(p)
+
+
 def test_get_skills_for_stage_1(registry):
     skills = get_skills_for_stage(registry, 1)
     assert len(skills) == 1
@@ -117,3 +147,26 @@ def test_get_skills_for_stage_excludes_mixed_stage_0_skill():
     names = [s["name"] for s in skills]
     assert "normal-skill" in names
     assert "mixed-skill" not in names
+
+
+def test_get_skills_for_stage_warns_when_no_skills_for_nonzero_stage():
+    registry = {"skills": [], "tools": []}
+    with pytest.warns(UserWarning, match="stage 3"):
+        assert get_skills_for_stage(registry, 3) == []
+
+
+def test_load_skill_by_name_blocks_path_escape(registry, tmp_path):
+    escape_registry = {
+        "skills": [
+            {
+                "name": "escape-skill",
+                "description": "Escapes project root",
+                "stages": [0],
+                "path": "../outside.md",
+            }
+        ],
+        "tools": [],
+    }
+    (tmp_path.parent / "outside.md").write_text("outside")
+    with pytest.raises(ValueError, match="escape-skill"):
+        load_skill_by_name(escape_registry, "escape-skill", tmp_path)

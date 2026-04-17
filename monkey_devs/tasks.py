@@ -51,6 +51,9 @@ def validate_tasks_yaml(path: pathlib.Path) -> None:
 async def update_task_status(path: pathlib.Path, task_id: str, status: str) -> None:
     async with _lock:
         data = yaml.safe_load(path.read_text())
+        ids = [t["id"] for t in data["tasks"]]
+        if task_id not in ids:
+            raise ValueError(f"Task {task_id!r} not found in {path}")
         for t in data["tasks"]:
             if t["id"] == task_id:
                 t["status"] = status

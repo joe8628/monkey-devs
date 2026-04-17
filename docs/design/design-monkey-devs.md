@@ -1,8 +1,8 @@
 # Design and Architecture Document: Monkey Devs
 
-**Version**: 1.3
+**Version**: 1.4
 **Date**: 2026-04-15
-**Status**: Finalized (v1.3 — security hardening + workflow edge-case remediation)
+**Status**: Finalized (v1.4 — required runtime defect remediation)
 **Spec Source**: spec-monkey-devs.md v1.2
 **Architect Session**: 2026-04-14
 
@@ -259,6 +259,7 @@ workflow:
   max_corrections_per_stage: 3
   max_handoff_chars: 400000   # semantic truncation applied if exceeded
   max_intake_turns: 20
+  max_tool_iterations: 30     # hard stop for repeated tool-call loops inside a single stage run
   auto_correction_on_validation_failure: true
 
 review:
@@ -475,7 +476,7 @@ Retry policy (implemented in `run_agentic_loop()`): exponential backoff with 3 a
 - **Skills**: `conversational-intake`, `requirements-writing`, `stack-evaluation`
 - **Tools**: `filesystem_read` (project docs), `filesystem_write` (`docs/`)
 - **Output artifacts**: `docs/concept.md`, `docs/spec.md`
-- **Multi-turn loop**: Stage 1 is a terminal input loop. After each LLM response is printed, the node calls `input("You: ")` and appends the user turn to `messages`. The loop continues until the LLM produces a response containing the sentinel `<intake-complete/>` or the turn count reaches `config.workflow.max_intake_turns` (default 20). On turn-limit exit, the node forces an artifact write from the best available draft, logs `intake_turn_limit_reached`, and surfaces that the intake ended due to the configured cap rather than agent completion.
+- **Multi-turn loop**: Stage 1 is a terminal input loop. After each LLM response is printed, the node awaits terminal input via `await asyncio.get_event_loop().run_in_executor(None, input, "\nYou: ")` and appends the user turn to `messages`. The loop continues until the LLM produces a response containing the sentinel `<intake-complete/>` or the turn count reaches `config.workflow.max_intake_turns` (default 20). On turn-limit exit, the node forces an artifact write from the best available draft, logs `intake_turn_limit_reached`, and surfaces that the intake ended due to the configured cap rather than agent completion.
 - **FRs fulfilled**: FR-13, FR-14, FR-34
 
 #### Stage Node: Architecture
@@ -952,7 +953,7 @@ Note: `registry.yaml`, `tasks.yaml`, and `skills/` are intentionally NOT gitigno
 - **Version**: LangGraph latest stable + `langgraph-checkpoint-sqlite`
 - **Integration point**: `graph.py` — defines the StateGraph with five primary stage nodes, one documentation sub-node (5a), five correction branches, two shared quality nodes (review, fix), and five gate interrupt points
 - **Failure mode**: If LangGraph fails mid-stage, SQLite checkpoint preserves state to the last completed node. `monkey-devs resume` restores from checkpoint.
-- **Interrupt pattern**: `interrupt()` called after the `fix_node` (or after the primary stage node when `review.enabled = false`). At workflow start the CLI writes the active LangGraph `thread_id` to `.opencode/active-thread-id` and refreshes that file on every run/resume. `monkey-devs approve` and `monkey-devs reject` resolve `thread_id` from that file first, falling back to a checkpoint lookup filtered by `project_path` metadata only if the pointer file is missing. The CLI then calls `graph.invoke(Command(resume=value), config={"configurable": {"thread_id": thread_id}})` where `value` is `"approve"` or `"reject"`.
+- **Interrupt pattern**: `interrupt()` called after the `fix_node` (or after the primary stage node when `review.enabled = false`). At workflow start the CLI writes the active LangGraph `thread_id` to `.opencode/active-thread-id` and refreshes that file on every run/resume. `monkey-devs approve` and `monkey-devs reject` resolve `thread_id` from that file first, falling back to a checkpoint lookup filtered by `project_path` metadata only if the pointer file is missing. The CLI then calls `graph.invoke(Command(resume=value), config={"configurable": {"thread_id": thread_id}})` where `value` is `{"decision": "approve"}` for approvals or `{"decision": "reject", "reason": "<user text>"}` for rejection. The first node after resume copies `value["decision"]` into `gate_decisions[current_stage]` and, for rejection, copies `value["reason"]` into `state["correction_reason"]` before correction routing executes.
 - **Graph shape**: `stage_N_node → review_node → fix_node → interrupt()` for Stages 1–4. Stage 5: `documentation_node → delivery_node → review_node → fix_node → interrupt()`. The `review_node` and `fix_node` are shared functions parameterized by `state["current_stage"]`.
 
 #### LiteLLM
@@ -979,6 +980,7 @@ async def run_agentic_loop(
     tools: list[dict],
     stage: int,
     timeout_seconds: int,
+    max_tool_iterations: int,
 ) -> str:
     """
     Execute the tool-calling agentic loop for a stage node.
@@ -986,8 +988,15 @@ async def run_agentic_loop(
     Raises after 3 failed retry attempts.
     """
     MAX_RETRIES = 3
+    tool_iteration_count = 0
 
     while True:
+        if tool_iteration_count >= max_tool_iterations:
+            raise AgentLoopLimitError(
+                f"Stage {stage} exceeded {max_tool_iterations} tool iterations on {model}. "
+                "Review the prompt or select a different model before retrying."
+            )
+
         # --- retry with exponential backoff ---
         last_exc = None
         for attempt in range(MAX_RETRIES):
@@ -1012,38 +1021,63 @@ async def run_agentic_loop(
 
         # --- consume stream ---
         response_content = ""
-        tool_calls: list = []
+        tool_call_chunks: dict[int, dict[str, str | None]] = {}
 
         async def consume_stream() -> None:
-            nonlocal response_content, tool_calls
+            nonlocal response_content, tool_call_chunks
             async for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     print(delta.content, end="", flush=True)
                     response_content += delta.content
                 if delta.tool_calls:
-                    tool_calls.extend(delta.tool_calls)
+                    for tc_delta in delta.tool_calls:
+                        entry = tool_call_chunks.setdefault(
+                            tc_delta.index,
+                            {"id": None, "name": None, "arguments": ""},
+                        )
+                        if tc_delta.id and entry["id"] is None:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name and entry["name"] is None:
+                                entry["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += tc_delta.function.arguments
+
+        normalized_tool_calls: list[dict] = []
 
         async with asyncio.timeout(timeout_seconds):
             await consume_stream()
+            normalized_tool_calls = [
+                {
+                    "id": entry["id"],
+                    "type": "function",
+                    "function": {
+                        "name": entry["name"],
+                        "arguments": entry["arguments"],
+                    },
+                }
+                for _, entry in sorted(tool_call_chunks.items())
+            ]
 
         # --- append assistant turn ---
         messages.append({
             "role": "assistant",
             "content": response_content,
-            "tool_calls": tool_calls if tool_calls else None,
+            "tool_calls": normalized_tool_calls if normalized_tool_calls else None,
         })
 
         # --- final response: no tool calls ---
-        if not tool_calls:
+        if not normalized_tool_calls:
             return response_content
 
         # --- execute tools and inject results ---
-        for tc in tool_calls:
+        tool_iteration_count += 1
+        for tc in normalized_tool_calls:
             result = await execute_tool(tc, stage=stage)
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": tc["id"],
                 "content": str(result),
             })
         # loop continues
@@ -1063,7 +1097,14 @@ async def concept_spec_node(state: WorkflowState) -> WorkflowState:
     final_response = ""
     turn_count = 0
     while True:
-        response = await run_agentic_loop(messages, model, tools, stage=1, timeout_seconds=timeout)
+        response = await run_agentic_loop(
+            messages,
+            model,
+            tools,
+            stage=1,
+            timeout_seconds=timeout,
+            max_tool_iterations=config.workflow.max_tool_iterations,
+        )
         turn_count += 1
         if "<intake-complete/>" in response:
             final_response = response
@@ -1073,7 +1114,7 @@ async def concept_spec_node(state: WorkflowState) -> WorkflowState:
             log_event("intake_turn_limit_reached", stage=1, turns=turn_count)
             break
         # Print response was handled inside run_agentic_loop; prompt user for next input
-        user_input = input("\nYou: ")
+        user_input = await asyncio.get_event_loop().run_in_executor(None, input, "\nYou: ")
         messages.append({"role": "user", "content": user_input})
         # run_agentic_loop already appended the assistant turn; add user turn and loop
 
@@ -1090,6 +1131,8 @@ async def concept_spec_node(state: WorkflowState) -> WorkflowState:
         "stage_models": {**state["stage_models"], 1: model},
     }
 ```
+
+`write_stage_artifacts(response_text: str, stage: int | str, state: WorkflowState) -> list[pathlib.Path]` is the artifact-writer used for stage outputs emitted as structured assistant text rather than via `filesystem_write` tool calls. For Stage 1 it parses stage-specific `<artifact path="...">...</artifact>` blocks from `response_text`, writes exactly `docs/concept.md` and `docs/spec.md`, and returns those absolute paths. For Stage 2 and Stage 5b the same helper may be reused only for their canonical text artifacts (`docs/architecture.md`, `.opencode/tasks.yaml`, `README.md`, `docs/delivery.md`) when the stage instructions require response-embedded artifacts. Nodes that persist files through successful `filesystem_write` tool calls do not re-write those files through this helper; they record the tool-confirmed paths directly into `state["stage_outputs"]`.
 
 All other stage nodes (architecture, code_fixing, delivery) call `run_agentic_loop()` directly without the multi-turn user input wrapper. The implementation node additionally reads its `task_id` from the `Send()` input rather than from `state["current_task_index"]`.
 
@@ -1158,11 +1201,11 @@ Implement in this sequence to minimize blocking:
 
 **IU-07 (Stage tool scoping + bash validator)**: `get_stage_tools(stage)` returns fully-formed OpenAI-format schemas (see Data Layer "Tool Schemas") filtered by stage — not registry metadata strings. `tools.py` also defines `validate_path(path: str, project_root: str) -> str`, which canonicalizes paths with `os.path.realpath()` and raises `FilesystemBoundaryError` when the resolved path escapes `project_root`; `execute_tool()` must call it before every filesystem tool operation. `validate_bash_command(command: str) -> None` enforces four sequential checks: (1) parse with `shlex.split(command)` — raise `BashValidationError` if `ValueError` (unmatched quotes); (2) reject if the raw command string or any token contains shell metacharacters `;`, `&&`, `||`, `$()`, backtick, `|`, `>`, `<`, `&`; (3) check `shlex.split(command)[0]` (the executable) against the allowlist set; (4) if the executable is `pip` or `pip3`, require the second token to be exactly `install`. Any check failure raises `BashValidationError`, logs a `bash_blocked` event, and returns the error message to the LLM as the `bash_execute` tool result so the model can recover. This protects the invocation string, but it does not sandbox the behavior of LLM-authored code executed by allowlisted programs.
 
-**IU-10 (LangGraph graph)**: The graph contains: five primary stage nodes, one documentation sub-node (5a), five correction branch nodes, one `dispatch_stage3` router node, one `correction_limit_reached` node, two shared quality nodes (`review_node`, `fix_node`), and five gate interrupt points.
+**IU-10 (LangGraph graph)**: The graph contains: five primary stage nodes, one documentation sub-node (5a), five correction branch nodes, one `dispatch_stage3` router node, one shared post-interrupt routing node, one `correction_limit_reached` node, two shared quality nodes (`review_node`, `fix_node`), and five gate interrupt points.
 
 Stage dispatch topology: after Stage 2 is approved, `dispatch_stage3` calls `topological_sort(state["tasks"])` and emits `Send("implementation_node", {"task_id": tid})` for each task in sorted order. LangGraph fans out; results merge automatically when all branches complete.
 
-Gate interrupt/resume: `interrupt()` is called after each primary stage node completes. The CLI writes the active `thread_id` to `.opencode/active-thread-id` at workflow start and refreshes it on every run/resume. On `monkey-devs approve` or `monkey-devs reject --reason "..."`, the CLI reads that file to resolve the active thread before calling `graph.invoke(Command(resume=decision), config={"configurable": {"thread_id": thread_id}})`. If the file is missing, the CLI may fall back to `checkpointer.list()` filtered by `project_path` metadata to recover the thread. The decision value is `"approve"` or `"reject"`.
+Gate interrupt/resume: `interrupt()` is called after each primary stage node completes. The CLI writes the active `thread_id` to `.opencode/active-thread-id` at workflow start and refreshes it on every run/resume. On `monkey-devs approve`, the CLI resumes with `Command(resume={"decision": "approve"})`. On `monkey-devs reject --reason "..."`, the CLI resumes with `Command(resume={"decision": "reject", "reason": "<user text>"})`. If the pointer file is missing, the CLI may fall back to `checkpointer.list()` filtered by `project_path` metadata to recover the thread. The shared post-interrupt routing node copies the resumed `decision` into `gate_decisions[current_stage]`, copies `reason` into `correction_reason` when present, clears `correction_reason` on approval, and only then evaluates the conditional edge for approve vs. correction routing.
 
 Correction routing: when a gate decision is `"reject"`, a conditional edge checks `state["correction_counts"][stage] >= config.workflow.max_corrections_per_stage`. If true, route to `correction_limit_reached` (which calls `interrupt()` with a blocking message). If false, increment `correction_counts[stage]` and route to `stage_N_correction`.
 
@@ -1178,7 +1221,7 @@ The graph has no bypass edges — all five stage gates are mandatory.
 
 **IU-09 (Task manager)**: `tasks.py` exposes: `load_tasks()`, `update_task_status()`, `topological_sort(tasks)` (Kahn's algorithm; raises `TaskCycleError` on cycle), and `validate_tasks_yaml(path)`. The module owns a per-file `asyncio.Lock()` for `.opencode/tasks.yaml`; every read-modify-write path acquires the lock before loading the file. `update_task_status()` writes atomically by serializing to `.opencode/tasks.yaml.tmp` and then replacing the target with `os.replace(tmp, tasks.yaml)`. `validate_tasks_yaml()` is called by the orchestrator after Stage 2 completes and before the Stage 2 gate is presented. It checks: valid YAML syntax, all required fields present (`id`, `title`, `status`, `depends_on`, `failure_classification`), `status` values are in `{pending, in-progress, done}`, `depends_on` entries reference valid task IDs. If validation fails and `config.workflow.auto_correction_on_validation_failure` is `true`, the orchestrator increments `correction_counts[2]`, automatically triggers the Architecture correction branch (not a user rejection), and logs `tasks_validation_failed`. If the flag is `false`, the invalid task file is surfaced directly at the stage gate for manual correction. `monkey-devs resume` also runs `validate_tasks_yaml()` before proceeding with any workflow state that depends on tasks.
 
-**IU-16 (CLI)**: `monkey-devs approve` and `monkey-devs reject` load `thread_id` from `.opencode/active-thread-id` and call `graph.invoke(Command(resume=decision), config={"configurable": {"thread_id": thread_id}})`. If that file is missing, they may recover by calling `checkpointer.list()` filtered by `project_path` metadata to find the active thread. The `decision` value is `"approve"` for `monkey-devs approve` and `"reject"` for `monkey-devs reject --reason "..."` (reason is stored to `WorkflowState.correction_reason` before resuming). `monkey-devs config set-model` must check `WorkflowState.workflow_status` before writing — if `active`, raise: `"Cannot change model configuration during an active workflow. Run 'monkey-devs status' to see current state."` `monkey-devs init` adds `.opencode/config.yaml`, `.opencode/workflow-state.db`, `.opencode/active-thread-id`, and `.opencode/logs/` to `.gitignore`, creates `.opencode/active-thread-id`, and initializes it with the new workflow thread. `monkey-devs resume` checks for `.opencode/` in the current directory; if absent and `--project-path` was not provided, prints: `"No .opencode/ directory found. Run from your project directory or pass --project-path."` `monkey-devs resume` calls `validate_artifacts(state)` before proceeding and re-runs `validate_tasks_yaml()` whenever the resumed workflow depends on `.opencode/tasks.yaml`; if any `stage_outputs` path is missing, it surfaces: `"Stage N artifact missing at <path>. Re-run that stage before resuming."` `monkey-devs config validate` validates `registry.yaml` with pydantic or jsonschema, fails loudly on malformed `stages:` data, and uses `config.py`'s `model_context_limits` map to warn when a stage's estimated handoff would exceed 80% of the assigned model's known context window.
+**IU-16 (CLI)**: `monkey-devs approve` and `monkey-devs reject` load `thread_id` from `.opencode/active-thread-id` and call `graph.invoke(Command(resume=value), config={"configurable": {"thread_id": thread_id}})`. If that file is missing, they may recover by calling `checkpointer.list()` filtered by `project_path` metadata to find the active thread. The resume payload is `{"decision": "approve"}` for `monkey-devs approve` and `{"decision": "reject", "reason": "<user text>"}` for `monkey-devs reject --reason "..."`; the graph's post-interrupt routing node is responsible for persisting `correction_reason` into `WorkflowState` before correction routing runs. `monkey-devs config set-model` must check `WorkflowState.workflow_status` before writing — if `active`, raise: `"Cannot change model configuration during an active workflow. Run 'monkey-devs status' to see current state."` `monkey-devs init` adds `.opencode/config.yaml`, `.opencode/workflow-state.db`, `.opencode/active-thread-id`, and `.opencode/logs/` to `.gitignore`, creates `.opencode/active-thread-id`, and initializes it with the new workflow thread. `monkey-devs resume` checks for `.opencode/` in the current directory; if absent and `--project-path` was not provided, prints: `"No .opencode/ directory found. Run from your project directory or pass --project-path."` `monkey-devs resume` calls `validate_artifacts(state)` before proceeding and re-runs `validate_tasks_yaml()` whenever the resumed workflow depends on `.opencode/tasks.yaml`; if any `stage_outputs` path is missing, it surfaces: `"Stage N artifact missing at <path>. Re-run that stage before resuming."` `monkey-devs config validate` validates `registry.yaml` with pydantic or jsonschema, fails loudly on malformed `stages:` data, and uses `config.py`'s `model_context_limits` map to warn when a stage's estimated handoff would exceed 80% of the assigned model's known context window.
 
 ---
 
@@ -1209,7 +1252,7 @@ The graph has no bypass edges — all five stage gates are mandatory.
 - **Decision**: Each stage has a paired correction branch node in the LangGraph graph.
 - **Rationale**: First-class LangGraph node. Carries rejection reason and prior output as inputs. Preserves full state history. Maps cleanly to LangGraph's interrupt + resume pattern.
 - **Alternatives considered**: State rewind (loses rejection context), in-place state patch (messy history)
-- **Consequences**: Graph has 10 primary nodes (5 stage + 5 correction) plus 5 gate interrupt points. Graph definition is more complex but behavior is explicit and auditable.
+- **Consequences**: Graph has 10 primary nodes (5 stage + 5 correction), one shared post-interrupt routing node, plus 5 gate interrupt points. Graph definition is more complex but behavior is explicit and auditable.
 
 ### ADR-004: Python CLI as Deterministic Orchestrator
 
@@ -1300,7 +1343,7 @@ The graph has no bypass edges — all five stage gates are mandatory.
 5. IU-06, IU-07 — Handoff composer + tool scoping (complete the orchestration layer)
 
 **Blocking items before generation can start:**
-- None. The 2026-04-15 remediation brief has been incorporated into this design (v1.3), including filesystem boundary enforcement, clarified bash residual risk, atomic `tasks.yaml` handling, full-stream timeouts, thread bootstrap, semantic handoff truncation, and validation hardening. The INSTRUCTIONS block templates for each stage node and the content of the four new skill files (IU-22 through IU-25) are the only items not yet written, but they do not block scaffold and module generation — they can be written in parallel with IU-01 through IU-09.
+- None. The 2026-04-15 remediation brief has been incorporated into this design (v1.4), including streaming tool-call reconstruction, non-blocking Stage 1 input handling, correction-reason resume payload handling, an explicit tool-iteration ceiling, and a defined `write_stage_artifacts()` contract. Deferred recommended and optional follow-ups are tracked in `docs/review-issue-log.md`.
 
 ---
 
@@ -1308,7 +1351,7 @@ The graph has no bypass edges — all five stage gates are mandatory.
 
 **DAD file**: `docs/design/design-monkey-devs.md`
 **Spec file**: `docs/specs/spec-monkey-devs.md` (finalized, v1.2)
-**Status**: Approved for generation (v1.3 — remediation brief applied)
+**Status**: Approved for generation (v1.4 — required runtime defect remediation applied)
 
 **Implementation units**:
 - IU-01: Python package scaffold — structure — ready

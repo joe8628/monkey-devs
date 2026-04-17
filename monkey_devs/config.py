@@ -22,6 +22,17 @@ class AppConfig(BaseModel):
     review: dict[str, bool] = {"enabled": True}
 
 
+_REQUIRED_MODEL_KEYS = {
+    "concept-spec",
+    "architecture",
+    "implementation",
+    "code-fixing",
+    "delivery",
+    "reviewer",
+    "fixer",
+}
+
+
 _KEY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"sk-[a-zA-Z0-9\-_]{20,}"),           # OpenAI
     re.compile(r"AIza[0-9A-Za-z\-_]{35}"),            # Google
@@ -35,8 +46,20 @@ class ConfigValidationError(Exception):
 
 def load_config(path: pathlib.Path) -> AppConfig:
     """Parse config.yaml and return a validated AppConfig."""
-    data = yaml.safe_load(path.read_text())
-    return AppConfig(**data)
+    try:
+        data = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Failed to parse config file {path}: {exc}") from exc
+    if data is None:
+        raise ValueError(f"Config file {path} is empty.")
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file {path} must contain a top-level mapping.")
+
+    config = AppConfig(**data)
+    missing_keys = sorted(_REQUIRED_MODEL_KEYS - set(config.models))
+    if missing_keys:
+        raise ValueError(f"Config file {path} is missing required model keys: {', '.join(missing_keys)}")
+    return config
 
 
 def validate_config(path: pathlib.Path) -> None:
